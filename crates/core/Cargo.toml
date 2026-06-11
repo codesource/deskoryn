@@ -1,0 +1,17 @@
+[package]
+name = "deskoryn-core"
+description = "Foundational domain types for Deskoryn: device ids, the unified virtual-desktop layout, input events, config, and the trust store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+blake3.workspace = true
+rand.workspace = true
+hex.workspace = true
+directories.workspace = true

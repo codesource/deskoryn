@@ -1,0 +1,28 @@
+[package]
+name = "deskoryn-input"
+description = "Input capture and injection abstraction with Linux (libei/evdev/uinput, X11) and Windows (Raw Input/SendInput) backends."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Enable real OS backends. Off by default so the trait surface + a no-op backend
+# compile everywhere (CI, the other platform, dry-run).
+linux-backend = []
+windows-backend = []
+
+[dependencies]
+deskoryn-core.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+# Real backend deps would be wired here, gated by the features above, e.g.:
+# [target.'cfg(target_os = "linux")'.dependencies]
+# reis = { version = "...", optional = true }     # libei (Wayland input emulation)
+# evdev = { version = "...", optional = true }     # evdev capture / uinput inject
+# [target.'cfg(target_os = "windows")'.dependencies]
+# windows = { version = "...", features = ["Win32_UI_Input_KeyboardAndMouse"], optional = true }

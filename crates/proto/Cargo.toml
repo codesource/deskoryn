@@ -1,0 +1,14 @@
+[package]
+name = "deskoryn-proto"
+description = "Deskoryn wire protocol: versioned message types, channel definitions, and length-prefixed framing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+deskoryn-core.workspace = true
+serde.workspace = true
+postcard.workspace = true
+bytes.workspace = true
+thiserror.workspace = true

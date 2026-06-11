@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+# To build the Windows agent, add the target explicitly when needed:
+#   rustup target add x86_64-pc-windows-msvc
+# It is intentionally NOT pinned here so local `cargo check` stays lean.

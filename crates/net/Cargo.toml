@@ -1,0 +1,34 @@
+[package]
+name = "deskoryn-net"
+description = "Secure session transport, LAN discovery, and device pairing for Deskoryn."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# `default` keeps the crate pure-Rust and fast to compile: it provides the trait
+# surface plus an in-memory loopback transport used by tests and the daemon's
+# dry-run mode. Enable `quic` / `mdns` to pull in the real implementations.
+default = []
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "tokio/rt"]
+mdns = ["dep:mdns-sd"]
+full = ["quic", "mdns"]
+
+[dependencies]
+deskoryn-core.workspace = true
+deskoryn-proto.workspace = true
+serde.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+rand.workspace = true
+
+# Optional, real implementations — off by default.
+quinn = { version = "0.11", optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rcgen = { version = "0.13", optional = true }
+mdns-sd = { version = "0.11", optional = true }

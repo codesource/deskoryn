@@ -1,0 +1,16 @@
+[package]
+name = "deskoryn-filexfer"
+description = "Background file/folder transfer: manifests, chunked streaming, resume, conflict handling, and progress."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+deskoryn-core.workspace = true
+deskoryn-proto.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+blake3.workspace = true

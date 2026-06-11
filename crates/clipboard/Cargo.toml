@@ -1,0 +1,20 @@
+[package]
+name = "deskoryn-clipboard"
+description = "Global clipboard synchronization (text, images, file lists) across machines."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+linux-backend = []
+windows-backend = []
+
+[dependencies]
+deskoryn-core.workspace = true
+deskoryn-proto.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true

@@ -1,0 +1,62 @@
+# Deskoryn — virtual single workstation across a Linux PC (3 monitors) and a
+# Windows PC (2 monitors). See docs/ARCHITECTURE.md for the big picture.
+#
+# The workspace is split so each concern (transport, input, clipboard, files,
+# audio) is an independent crate with a platform-agnostic trait surface plus
+# OS-specific implementations gated behind `cfg`/feature flags.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/core",
+    "crates/net",
+    "crates/input",
+    "crates/clipboard",
+    "crates/filexfer",
+    "crates/audio",
+    "crates/daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+authors = ["Deskoryn contributors"]
+repository = "https://example.com/deskoryn"
+
+# Shared, pure-Rust dependencies that compile on Linux and Windows without
+# native toolchains. Heavy / OS-binding crates (quinn, pipewire, windows,
+# reis/libei) are declared per-crate as OPTIONAL deps behind feature flags so
+# that a default `cargo check` stays fast and platform-portable.
+[workspace.dependencies]
+deskoryn-proto = { path = "crates/proto" }
+deskoryn-core = { path = "crates/core" }
+deskoryn-net = { path = "crates/net" }
+deskoryn-input = { path = "crates/input" }
+deskoryn-clipboard = { path = "crates/clipboard" }
+deskoryn-filexfer = { path = "crates/filexfer" }
+deskoryn-audio = { path = "crates/audio" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+postcard = { version = "1", features = ["use-std"] }
+bytes = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "fs"] }
+async-trait = "0.1"
+blake3 = "1"
+rand = "0.8"
+hex = "0.4"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"

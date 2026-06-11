@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local runtime state (trust store, generated keys/certs, logs)
+/run
+*.log
+
+# Tauri / node UI build artifacts
+/ui/node_modules
+/ui/dist
+/ui/src-tauri/target
+
+# OS cruft
+.DS_Store
+Thumbs.db
