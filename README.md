@@ -1,15 +1,16 @@
 # Deskoryn
 
-**One workstation, five monitors, two computers.**
+**Your computers, one workstation.**
 
-Deskoryn unifies a **Linux PC (3 monitors)** and a **Windows PC (2 monitors)**
-into a single virtual desktop. Move one cursor across all five screens, share a
-global clipboard, drag files between machines, and forward audio — while every
-monitor stays physically plugged into its own computer.
+Deskoryn unifies multiple computers into a single virtual desktop. Move one
+cursor seamlessly across every screen, share a global clipboard, drag files
+between machines, and forward audio — while each monitor stays physically plugged
+into its own computer. Arrange your displays however they sit on your desk and
+the cursor flows between them.
 
-It is **local-first** (LAN only, no cloud), **peer-to-peer**, and **encrypted**.
-It is *not* a remote-desktop, VM, or screen-mirroring tool — it aims to feel like
-*one computer with five monitors*, not a viewer onto another machine.
+It is **cross-platform**, **local-first** (LAN only, no cloud), **peer-to-peer**,
+and **encrypted**. It is *not* a remote-desktop, VM, or screen-mirroring tool — it
+aims to feel like *one computer*, not a viewer onto another machine.
 
 > Status: **early skeleton (M0).** The architecture, wire protocol, security
 > model, virtual-desktop layout math, and the cursor focus state machine are
@@ -19,13 +20,13 @@ It is *not* a remote-desktop, VM, or screen-mirroring tool — it aims to feel l
 
 ## Features (target)
 
-- **Seamless input** — one cursor across all monitors, keyboard focus follows the
-  mouse, custom layout, switch/lock hotkeys.
+- **Seamless input** — one cursor across all screens, keyboard focus follows the
+  mouse, configurable monitor layout, switch/lock hotkeys.
 - **Global clipboard** — text, images, and files/folders, both directions.
 - **File transfer** — drag-and-drop, background service, resume, progress,
   conflict handling, optional shared folders.
-- **Audio forwarding** — Windows↔Linux, Opus, low-latency or high-quality modes,
-  selectable devices.
+- **Audio forwarding** — between machines, Opus, low-latency or high-quality
+  modes, selectable devices.
 - **Secure pairing** — mDNS discovery, manual IP, 6-digit/QR verification, TLS
   1.3, remembered devices.
 - **Reliable** — auto-reconnect after sleep/reboot/network loss, live layout
@@ -49,13 +50,13 @@ cargo build -p deskoryn-daemon --features windows   # on/for Windows
 
 ## How it works (one paragraph)
 
-Both machines run the same background daemon, `deskorynd`. Every monitor from both
-machines is placed into one global coordinate space — the *virtual desktop*. The
-machine whose monitor currently holds the cursor is "active"; when the cursor
-crosses an edge onto the other machine's monitor, control hands off over an
-encrypted QUIC session. Clipboard, files, and audio ride the same session on
-separate channels. A small tray app configures everything; the daemon does the
-work.
+Each machine runs the same background daemon, `deskorynd`. Every monitor from
+every machine is placed into one global coordinate space — the *virtual desktop* —
+arranged to match your physical setup. The machine whose monitor currently holds
+the cursor is "active"; when the cursor crosses an edge onto a monitor owned by
+another machine, control hands off over an encrypted QUIC session. Clipboard,
+files, and audio ride the same session on separate channels. A small tray app
+configures everything; the daemon does the work.
 
 ## Documentation
 
