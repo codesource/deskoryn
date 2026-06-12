@@ -312,6 +312,17 @@ impl QuicSession {
     pub fn fingerprint(&self) -> CertFingerprint {
         self.fingerprint
     }
+
+    /// Derive a shared secret bound to *this* TLS connection (RFC 5705 exporter).
+    /// Both peers obtain identical bytes; a man-in-the-middle terminating two
+    /// separate TLS sessions cannot. Used as the channel binding for pairing SAS.
+    pub fn channel_binding(&self) -> Result<[u8; 32], SessionError> {
+        let mut out = [0u8; 32];
+        self.conn
+            .export_keying_material(&mut out, b"deskoryn-pairing-sas-v1", b"")
+            .map_err(|_| SessionError::Transport("TLS exporter unavailable".into()))?;
+        Ok(out)
+    }
 }
 
 #[async_trait]
@@ -473,9 +484,33 @@ impl QuicEndpoint {
         Ok(Box::new(session))
     }
 
+    /// Dial a peer for **pairing**: establish the connection without consulting
+    /// the trust store, returning the concrete session so the caller can read its
+    /// [`fingerprint`](QuicSession::fingerprint) and
+    /// [`channel_binding`](QuicSession::channel_binding) to compute the SAS. The
+    /// returned session's `peer()` is a placeholder until pairing learns the id.
+    pub async fn connect_unverified(&self, addr: SocketAddr) -> Result<QuicSession, SessionError> {
+        let conn = self
+            .endpoint
+            .connect(addr, "deskoryn")
+            .map_err(te)?
+            .await
+            .map_err(te)?;
+        let fp = peer_fingerprint(&conn)?;
+        QuicSession::establish(conn, true, DeviceId::from_bytes([0u8; 16]), fp).await
+    }
+
+    /// Accept an inbound connection for **pairing**, without a trust check.
+    pub async fn accept_unverified(&self) -> Result<QuicSession, SessionError> {
+        let incoming = self.endpoint.accept().await.ok_or(SessionError::Closed)?;
+        let conn = incoming.await.map_err(te)?;
+        let fp = peer_fingerprint(&conn)?;
+        QuicSession::establish(conn, false, DeviceId::from_bytes([0u8; 16]), fp).await
+    }
+
     /// Accept the next inbound connection, identifying the peer by reverse-
     /// looking-up its certificate fingerprint in the trust store. Unknown
-    /// (unpaired) peers are rejected here; pairing will use a dedicated path.
+    /// (unpaired) peers are rejected here; pairing uses [`accept_unverified`].
     pub async fn accept(&self) -> Result<Box<dyn Session>, SessionError> {
         let incoming = self
             .endpoint

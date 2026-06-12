@@ -16,6 +16,7 @@
 mod control;
 mod focus;
 mod ipc;
+mod pair;
 mod session;
 mod supervisor;
 
@@ -44,8 +45,14 @@ enum Cmd {
     },
     /// Print resolved config + paths and exit.
     Info,
-    /// Begin pairing with a peer at host:port.
-    Pair { addr: String },
+    /// Pair with a peer: dial `host:port`, or wait with `--listen`.
+    Pair {
+        /// Address of the peer to dial (omit when using --listen).
+        addr: Option<String>,
+        /// Wait for an incoming pairing request instead of dialing.
+        #[arg(long)]
+        listen: bool,
+    },
     /// List remembered (trusted) devices.
     Devices,
 }
@@ -75,12 +82,7 @@ async fn main() -> anyhow::Result<()> {
             println!("discovery:  {}", config.network.discovery_enabled);
             Ok(())
         }
-        Cmd::Pair { addr } => {
-            // TODO(impl): dial, run the SAS flow (deskoryn_net::pairing), prompt
-            // the user to compare codes, then persist the trust record.
-            println!("Pairing with {addr} — compare the 6-digit code on both screens.");
-            Ok(())
-        }
+        Cmd::Pair { addr, listen } => pair::run(config, paths, addr, listen).await,
         Cmd::Devices => {
             let store = deskoryn_core::trust::TrustStore::load(&paths.trust_file())?;
             for d in &store.devices {
