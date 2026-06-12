@@ -1,18 +1,14 @@
 //! Per-peer session driver.
 //!
-//! Owns one [`Session`] and the [`FocusMachine`], then pumps the logical channels
-//! concurrently. This is where module wiring happens:
+//! Owns one [`Session`] and runs its logical-channel pumps concurrently:
 //!
 //! * **Control**: handshake (`Hello`), heartbeat (`Ping`/`Pong` → drives
-//!   reconnect detection), and `LayoutUpdate`.
-//! * **Input**: when active, read captured events from `deskoryn-input`, run them
-//!   through the [`FocusMachine`], inject locally or forward + hand off.
-//! * **Clipboard / FileXfer / Audio**: bridge each module crate to its channel.
-//!
-//! The body below establishes the handshake and the structure; the per-channel
-//! pumps are sketched with `TODO(impl)` where they call into the feature crates.
+//!   reconnect detection), and `LayoutUpdate` (see [`crate::control`]).
+//! * **Input**: capture local input, forward across the boundary, inject what the
+//!   peer forwards (see [`crate::input`]).
+//! * **Clipboard / FileXfer / Audio**: bridged by their pump modules; triggered
+//!   by config / UI in later milestones.
 
-use crate::focus::{FocusAction, FocusMachine, Role};
 use deskoryn_core::config::AppConfig;
 use deskoryn_net::transport::Session;
 use deskoryn_proto::{Channel, Control, PROTOCOL_VERSION};
@@ -48,51 +44,39 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
         }
     }
 
-    // The machine that hosts monitor index 0 of the anchor starts active; here
-    // we simply start active if we contributed any monitors.
-    let start_active = config.layout.monitors.iter().any(|m| m.device() == config.device.id);
-    let mut focus = FocusMachine::new(
-        config.device.id,
-        layout,
-        start_active,
-        config.input.edge_resistance_px,
-    );
+    // Build the input controller over the combined virtual desktop, starting the
+    // cursor on one of our own monitors.
+    let start = start_position(&layout, config.device.id);
+    let controller = crate::input::Controller::new(layout, config.device.id, start);
+    let capture = deskoryn_input::platform::open_capture()?;
+    let injector = deskoryn_input::platform::open_injector()?;
+    tracing::info!(backend = ?deskoryn_input::platform::detect(), "input backend");
 
     // --- Concurrent channel pumps -------------------------------------------
     //
-    // Demonstrate the focus logic deterministically, then run the live control
-    // pump (heartbeat + control messages) for the lifetime of the session.
-    demo_focus_loop(&mut focus, &peer);
+    // Run the control pump (heartbeat + control messages) and the input pump
+    // (capture -> forward / inject) for the lifetime of the session; whichever
+    // ends first tears the session down so the supervisor can reconnect.
+    tracing::info!(%peer, "session ready; starting pumps");
+    let control = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default());
+    let input = crate::input::run_input(session.as_ref(), controller, capture, injector);
 
-    // TODO(impl): additionally spawn and join the latency-critical pumps:
-    //   - input pump: capture -> focus -> inject / forward.
-    //   - clipboard pump: ClipboardMonitor::next_change -> Offer; handle Pull.
-    //   - filexfer pump: accept Offers, stream chunks, report Progress.
-    //   - audio pump: capture -> Opus -> datagrams; datagrams -> jitter -> play.
-
-    tracing::info!(%peer, role = ?focus.role(), "session ready; starting heartbeat");
-    let end = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default()).await?;
-    tracing::info!(%peer, ?end, "session ended");
+    let end = tokio::select! {
+        r = control => { r.map(|e| format!("{e:?}")) }
+        r = input => { r.map(|_| "input pump ended".to_string()) }
+    }?;
+    tracing::info!(%peer, %end, "session ended");
     Ok(())
 }
 
-/// Drives a couple of motions through the focus machine so `--dry-run` produces
-/// visible, deterministic output. Not part of the real loop.
-fn demo_focus_loop(focus: &mut FocusMachine, peer: &deskoryn_core::DeviceId) {
-    use deskoryn_core::input::Modifiers;
-    if focus.role() != Role::Active {
-        tracing::info!(%peer, "starting idle; awaiting Enter from peer");
-        return;
-    }
-    for (dx, dy) in [(1000, 200), (5000, 0), (50, 0)] {
-        match focus.on_motion(dx, dy, Modifiers::empty()) {
-            FocusAction::MoveLocal(p) => tracing::debug!(?p, "move cursor locally"),
-            FocusAction::HandOff { to, entry, .. } => {
-                tracing::info!(%to, ?entry, "cursor crossed machine boundary — handing off")
-            }
-            other => tracing::debug!(?other, "focus action"),
-        }
-    }
+/// Center of the first monitor this device owns (or the desktop origin).
+fn start_position(layout: &deskoryn_core::VirtualDesktop, me: deskoryn_core::DeviceId) -> deskoryn_core::geometry::Point {
+    layout
+        .monitors
+        .iter()
+        .find(|m| m.device() == me)
+        .map(|m| deskoryn_core::geometry::Point::new(m.bounds.x + m.bounds.w / 2, m.bounds.y + m.bounds.h / 2))
+        .unwrap_or(deskoryn_core::geometry::Point::new(0, 0))
 }
 
 fn capabilities_from(config: &AppConfig) -> deskoryn_proto::Capabilities {

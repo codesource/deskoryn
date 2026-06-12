@@ -17,6 +17,7 @@ mod audio;
 mod clipboard;
 mod control;
 mod focus;
+mod input;
 mod ipc;
 mod pair;
 mod session;
