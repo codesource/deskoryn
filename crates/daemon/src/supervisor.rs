@@ -5,6 +5,7 @@
 
 use deskoryn_core::config::{AppConfig, Paths};
 use std::sync::Arc;
+#[cfg(any(feature = "linux", feature = "windows"))]
 use std::time::Duration;
 
 pub async fn run(config: Arc<AppConfig>, paths: Paths, dry_run: bool) -> anyhow::Result<()> {
@@ -19,22 +20,115 @@ pub async fn run(config: Arc<AppConfig>, paths: Paths, dry_run: bool) -> anyhow:
         return run_dry(config).await;
     }
 
-    // --- Real path (requires the `linux`/`windows` build features) -----------
-    //
-    // TODO(impl):
-    //  1. load-or-generate the device identity (quic::DeviceIdentity), persist
-    //     under paths.{key,cert}_file();
-    //  2. load the trust store (paths.trust_file());
-    //  3. bind a QuicEndpoint and, if enabled, start mDNS advertise/browse;
-    //  4. loop: accept inbound sessions and dial known/discovered peers; for each
-    //     established Session, spawn session::run; on error, reconnect with
-    //     capped exponential backoff (see `backoff` below).
-    let _ = (&paths,);
-    let mut backoff = Backoff::default();
-    loop {
-        tracing::warn!("real transport not built in (enable the `linux`/`windows` feature); idling");
-        tokio::time::sleep(backoff.next()).await;
+    #[cfg(any(feature = "linux", feature = "windows"))]
+    {
+        run_real(config, paths).await
     }
+
+    #[cfg(not(any(feature = "linux", feature = "windows")))]
+    {
+        let _ = paths;
+        tracing::warn!(
+            "real transport not built in; rebuild with `--features linux` (or `windows`). Idling."
+        );
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// Real, networked run: bind a QUIC endpoint, accept inbound sessions, and dial
+/// known peers with auto-reconnect. Requires the `linux`/`windows` feature
+/// (which enables `deskoryn-net/full`).
+#[cfg(any(feature = "linux", feature = "windows"))]
+async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
+    use deskoryn_core::trust::TrustStore;
+    use deskoryn_net::quic::{DeviceIdentity, QuicEndpoint};
+    use tokio::sync::Mutex;
+
+    let identity = Arc::new(DeviceIdentity::load_or_generate(
+        config.device.id,
+        &paths.cert_file(),
+        &paths.key_file(),
+    )?);
+    tracing::info!(fingerprint = %identity.fingerprint.short(), "device identity ready");
+
+    let trust = Arc::new(Mutex::new(TrustStore::load(&paths.trust_file())?));
+    let endpoint = Arc::new(QuicEndpoint::bind(config.network.listen_port, identity, trust.clone()).await?);
+    tracing::info!(port = endpoint.local_port(), "QUIC endpoint bound");
+
+    if config.network.discovery_enabled {
+        // TODO(impl): start mDNS advertise/browse and feed discovered PeerHints
+        // into the dial loop. For now, peers come from config + the trust store.
+        tracing::info!("mDNS discovery not yet implemented; using static peers + remembered devices");
+    }
+
+    // Accept loop: every inbound, authenticated session gets its own task.
+    {
+        let endpoint = endpoint.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            loop {
+                match endpoint.accept().await {
+                    Ok(session) => {
+                        let config = config.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::session::run(config, session).await {
+                                tracing::warn!(error = %e, "inbound session ended");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "accept rejected/failed");
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    // Dial loop: one reconnecting task per known address (static peers +
+    // remembered `last_address`es).
+    let mut addrs: Vec<String> = config.network.static_peers.clone();
+    {
+        let t = trust.lock().await;
+        for d in &t.devices {
+            if let Some(a) = &d.last_address {
+                addrs.push(a.clone());
+            }
+        }
+    }
+    addrs.sort();
+    addrs.dedup();
+
+    for addr_str in addrs {
+        let endpoint = endpoint.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            let mut backoff = Backoff::default();
+            loop {
+                match addr_str.parse() {
+                    Ok(addr) => match endpoint.connect_any(addr).await {
+                        Ok(session) => {
+                            backoff = Backoff::default();
+                            if let Err(e) = crate::session::run(config.clone(), session).await {
+                                tracing::warn!(error = %e, peer = %addr_str, "session ended");
+                            }
+                        }
+                        Err(e) => tracing::debug!(error = %e, peer = %addr_str, "dial failed"),
+                    },
+                    Err(e) => {
+                        tracing::error!(error = %e, "invalid peer address: {addr_str}");
+                        return;
+                    }
+                }
+                tokio::time::sleep(backoff.next()).await;
+            }
+        });
+    }
+
+    // The spawned loops do the work; park until shutdown.
+    std::future::pending::<()>().await;
+    Ok(())
 }
 
 /// Run the whole daemon in one process over a loopback session, with a synthetic
@@ -79,11 +173,13 @@ async fn run_dry(config: Arc<AppConfig>) -> anyhow::Result<()> {
 }
 
 /// Capped exponential backoff for reconnection.
+#[cfg(any(feature = "linux", feature = "windows"))]
 struct Backoff {
     current: Duration,
     max: Duration,
 }
 
+#[cfg(any(feature = "linux", feature = "windows"))]
 impl Default for Backoff {
     fn default() -> Self {
         Self {
@@ -93,6 +189,7 @@ impl Default for Backoff {
     }
 }
 
+#[cfg(any(feature = "linux", feature = "windows"))]
 impl Backoff {
     fn next(&mut self) -> Duration {
         let d = self.current;

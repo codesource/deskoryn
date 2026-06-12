@@ -27,6 +27,7 @@ cargo build --workspace
 # pairing SAS — is unit-tested and runs without hardware)
 cargo test --workspace
 cargo test -p deskoryn-core layout         # a single crate / filter
+cargo test -p deskoryn-net --features quic # real QUIC transport (mutual-TLS, pinning)
 
 # Run the daemon end-to-end in one process over an in-memory loopback session.
 # Touches no real OS input/clipboard/audio or network — best for development.
@@ -64,7 +65,7 @@ with thorough tests — change them test-first.
 |-------|------|
 | `core` | Domain model: ids, geometry, **virtual-desktop layout + transition math**, input events, config (TOML), trust store. No I/O, no async. |
 | `proto` | Wire protocol: per-channel message enums + length-prefixed `postcard` framing. Depends only on `core`. |
-| `net` | Secure `Session` transport, `Discovery`, and `pairing` (SAS). Trait surface + in-memory loopback by default; real QUIC/mDNS behind features. |
+| `net` | Secure `Session` transport, `Discovery`, and `pairing` (SAS). Trait surface + in-memory loopback by default; **real QUIC + mutual-TLS + cert-pinning implemented** behind `--features quic` (`net::quic`); mDNS still stubbed. |
 | `input` | `Capture`/`Injector` traits + OS backends (libei/X11/evdev, Raw Input/`SendInput`). |
 | `clipboard` | `ClipboardMonitor` (text/image/file-list, delayed rendering, echo suppression). |
 | `filexfer` | Manifests, chunk streaming, resume, conflict policy, progress. |

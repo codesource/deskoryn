@@ -23,16 +23,23 @@ and focus hand-off in-process.
 
 ---
 
-## M1 — Real secure transport + discovery
+## M1 — Real secure transport + discovery 🚧 (in progress)
 
-- Implement `net::quic` (quinn + rustls): mutual-TLS endpoint, per-channel
-  streams, datagrams, cert-pinning verifier.
-- Implement mDNS advertise/browse; manual `host:port` pairing.
-- SAS pairing flow wired to a minimal CLI prompt (`deskorynd pair`).
-- Auto-reconnect + heartbeat in `supervisor`.
+- ✅ `net::quic` (quinn + rustls): mutual-TLS endpoint, per-channel streams,
+  audio datagrams, cert-pinning verifier (`PinVerifier`), self-signed identity
+  generation/persistence (`DeviceIdentity`). Covered by an integration test that
+  mutually authenticates two endpoints on localhost, exchanges a framed `Hello`,
+  passes an audio datagram, and rejects an unpaired peer
+  (`cargo test -p deskoryn-net --features quic`).
+- ✅ `supervisor` real path: bind endpoint, accept loop, per-peer dial loop with
+  capped-backoff auto-reconnect (`--features linux`/`windows`).
+- ⬜ mDNS advertise/browse (currently: static peers + remembered `last_address`).
+- ⬜ SAS pairing flow wired to a CLI/tray prompt (`deskorynd pair`) — the crypto
+  (`net::pairing`) and trust store exist; the interactive accept path is pending.
+- ⬜ `Control::Ping`/`Pong` heartbeat task in `session`.
 
 **Exit:** two daemons on the LAN pair once, then reconnect automatically across a
-network blip. No input yet — verified with a debug "echo" channel.
+network blip. No input yet — verified with the handshake + an echo channel.
 
 ---
 
