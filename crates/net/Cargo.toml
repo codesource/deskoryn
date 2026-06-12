@@ -12,7 +12,7 @@ license.workspace = true
 # dry-run mode. Enable `quic` / `mdns` to pull in the real implementations.
 default = []
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "tokio/rt"]
-mdns = ["dep:mdns-sd"]
+mdns = ["dep:mdns-sd", "dep:hex"]
 full = ["quic", "mdns"]
 
 [dependencies]
@@ -31,7 +31,8 @@ rand.workspace = true
 quinn = { version = "0.11", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rcgen = { version = "0.13", optional = true }
-mdns-sd = { version = "0.11", optional = true }
+mdns-sd = { version = "0.11", optional = true, features = ["async"] }
+hex = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

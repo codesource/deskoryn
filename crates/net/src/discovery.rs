@@ -58,8 +58,123 @@ impl Discovery for NullDiscovery {
 pub mod mdns {
     //! mDNS-SD backend built on the `mdns-sd` crate.
     //!
-    //! TODO(impl): register a `ServiceInfo` for [`SERVICE_TYPE`] carrying TXT
-    //! records `id=<hex>`, `name=<utf8>`, `fp=<hex>`; browse the same type and
-    //! map each resolved service into a [`PeerHint`]. Refresh on TTL, and prefer
-    //! `trusted.json` `last_address` as a fast-path before multicast resolves.
+    //! Advertises a `ServiceInfo` for [`SERVICE_TYPE`] carrying TXT records
+    //! `id=<hex>`, `name=<utf8>`, `fp=<hex>`, and browses the same type, mapping
+    //! each resolved service into a [`PeerHint`] (skipping our own id).
+
+    use super::{Discovery, PeerHint, SERVICE_TYPE};
+    use async_trait::async_trait;
+    use deskoryn_core::trust::CertFingerprint;
+    use deskoryn_core::DeviceId;
+    use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+    use std::sync::Mutex as StdMutex;
+    use tokio::sync::{mpsc, Mutex};
+
+    pub struct MdnsDiscovery {
+        daemon: ServiceDaemon,
+        rx: Mutex<mpsc::UnboundedReceiver<PeerHint>>,
+        tx: mpsc::UnboundedSender<PeerHint>,
+        /// Registered service fullname, kept so we can unregister on shutdown.
+        registered: StdMutex<Option<String>>,
+    }
+
+    fn io(e: impl std::fmt::Display) -> std::io::Error {
+        std::io::Error::other(e.to_string())
+    }
+
+    impl MdnsDiscovery {
+        pub fn new() -> std::io::Result<Self> {
+            let daemon = ServiceDaemon::new().map_err(io)?;
+            let (tx, rx) = mpsc::unbounded_channel();
+            Ok(Self {
+                daemon,
+                rx: Mutex::new(rx),
+                tx,
+                registered: StdMutex::new(None),
+            })
+        }
+
+        fn spawn_browser(&self, local: DeviceId) -> std::io::Result<()> {
+            let receiver = self.daemon.browse(SERVICE_TYPE).map_err(io)?;
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                while let Ok(event) = receiver.recv_async().await {
+                    if let ServiceEvent::ServiceResolved(info) = event {
+                        if let Some(hint) = to_hint(&info) {
+                            if hint.device != local {
+                                let _ = tx.send(hint);
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(())
+        }
+    }
+
+    fn to_hint(info: &ServiceInfo) -> Option<PeerHint> {
+        let device = info
+            .get_property_val_str("id")
+            .and_then(|s| DeviceId::from_str(s).ok())?;
+        let name = info
+            .get_property_val_str("name")
+            .unwrap_or("deskoryn")
+            .to_string();
+        let fingerprint = info.get_property_val_str("fp").and_then(parse_fp);
+        let ip = info.get_addresses().iter().next().copied()?;
+        Some(PeerHint {
+            device,
+            name,
+            addr: SocketAddr::new(ip, info.get_port()),
+            fingerprint,
+        })
+    }
+
+    fn parse_fp(s: &str) -> Option<CertFingerprint> {
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(s, &mut bytes).ok()?;
+        Some(CertFingerprint(bytes))
+    }
+
+    #[async_trait]
+    impl Discovery for MdnsDiscovery {
+        async fn advertise(
+            &self,
+            device: DeviceId,
+            name: &str,
+            port: u16,
+            fp: CertFingerprint,
+        ) -> std::io::Result<()> {
+            let instance = device.short();
+            let host = format!("{}.local.", device.short());
+            let id_s = device.to_string();
+            let fp_s = hex::encode(fp.0);
+            let props: [(&str, &str); 3] = [("id", &id_s), ("name", name), ("fp", &fp_s)];
+
+            // Empty address + `enable_addr_auto` lets mdns-sd advertise the host's
+            // current interface addresses (and update them as they change).
+            let info = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", port, &props[..])
+                .map_err(io)?
+                .enable_addr_auto();
+            let fullname = info.get_fullname().to_string();
+            self.daemon.register(info).map_err(io)?;
+            *self.registered.lock().unwrap() = Some(fullname);
+
+            self.spawn_browser(device)?;
+            Ok(())
+        }
+
+        async fn next_peer(&self) -> Option<PeerHint> {
+            self.rx.lock().await.recv().await
+        }
+
+        async fn shutdown(&self) {
+            if let Some(full) = self.registered.lock().unwrap().clone() {
+                let _ = self.daemon.unregister(&full);
+            }
+            let _ = self.daemon.shutdown();
+        }
+    }
 }

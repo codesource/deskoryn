@@ -33,13 +33,16 @@ and focus hand-off in-process.
   (`cargo test -p deskoryn-net --features quic`).
 - ✅ `supervisor` real path: bind endpoint, accept loop, per-peer dial loop with
   capped-backoff auto-reconnect (`--features linux`/`windows`).
-- ⬜ mDNS advertise/browse (currently: static peers + remembered `last_address`).
-- ⬜ SAS pairing flow wired to a CLI/tray prompt (`deskorynd pair`) — the crypto
-  (`net::pairing`) and trust store exist; the interactive accept path is pending.
-- ⬜ `Control::Ping`/`Pong` heartbeat task in `session`.
+- ✅ mDNS advertise/browse (`net::discovery::mdns`): TXT records (id/name/fp),
+  resolve → `PeerHint`, auto-dial trusted peers with a single-dialer + active-set
+  dedup in the supervisor. Verified live between two daemons on localhost.
+- ✅ SAS pairing flow wired to `deskorynd pair` (dial or `--listen`); verified
+  live (matching 6-digit code on both processes, trust persisted).
+- ✅ `Control::Ping`/`Pong` heartbeat in `control::run_control` (also graceful
+  `Goodbye`).
 
-**Exit:** two daemons on the LAN pair once, then reconnect automatically across a
-network blip. No input yet — verified with the handshake + an echo channel.
+**M1 is functionally complete:** two daemons discover each other, pair once, then
+reconnect automatically. No input sharing yet (that's M2).
 
 ---
 

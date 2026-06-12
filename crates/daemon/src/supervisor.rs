@@ -52,14 +52,16 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     )?);
     tracing::info!(fingerprint = %identity.fingerprint.short(), "device identity ready");
 
+    let identity_fp = identity.fingerprint;
     let trust = Arc::new(Mutex::new(TrustStore::load(&paths.trust_file())?));
     let endpoint = Arc::new(QuicEndpoint::bind(config.network.listen_port, identity, trust.clone()).await?);
     tracing::info!(port = endpoint.local_port(), "QUIC endpoint bound");
 
     if config.network.discovery_enabled {
-        // TODO(impl): start mDNS advertise/browse and feed discovered PeerHints
-        // into the dial loop. For now, peers come from config + the trust store.
-        tracing::info!("mDNS discovery not yet implemented; using static peers + remembered devices");
+        match start_discovery(&config, &endpoint, &trust, identity_fp).await {
+            Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),
+            Err(e) => tracing::warn!(error = %e, "mDNS discovery unavailable"),
+        }
     }
 
     // Accept loop: every inbound, authenticated session gets its own task.
@@ -128,6 +130,72 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
 
     // The spawned loops do the work; park until shutdown.
     std::future::pending::<()>().await;
+    Ok(())
+}
+
+/// Start mDNS: advertise this device and dial discovered, **already-trusted**
+/// peers. To avoid both peers dialing each other, only the device with the
+/// lexicographically smaller id initiates; the other waits to be accepted.
+#[cfg(any(feature = "linux", feature = "windows"))]
+async fn start_discovery(
+    config: &Arc<AppConfig>,
+    endpoint: &Arc<deskoryn_net::quic::QuicEndpoint>,
+    trust: &Arc<tokio::sync::Mutex<deskoryn_core::trust::TrustStore>>,
+    fingerprint: deskoryn_core::trust::CertFingerprint,
+) -> anyhow::Result<()> {
+    use deskoryn_net::discovery::{mdns::MdnsDiscovery, Discovery};
+
+    let discovery = Arc::new(MdnsDiscovery::new()?);
+    discovery
+        .advertise(config.device.id, &config.device.name, endpoint.local_port(), fingerprint)
+        .await?;
+
+    let endpoint = endpoint.clone();
+    let config = config.clone();
+    let trust = trust.clone();
+    // Peers we already have a session with (or are dialing), so repeated mDNS
+    // re-resolutions don't spawn a storm of duplicate connections.
+    let active: Arc<tokio::sync::Mutex<std::collections::HashSet<deskoryn_core::DeviceId>>> =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+
+    tokio::spawn(async move {
+        while let Some(hint) = discovery.next_peer().await {
+            let trusted = trust.lock().await.get(hint.device).is_some();
+            if !trusted {
+                tracing::debug!(peer = %hint.device.short(), "discovered an unpaired peer; run `deskorynd pair` to connect");
+                continue;
+            }
+            // Deterministic single-dialer rule: only the smaller id initiates.
+            if config.device.id.as_bytes() >= hint.device.as_bytes() {
+                continue;
+            }
+            // Skip if we're already connected to / dialing this peer.
+            {
+                let mut active = active.lock().await;
+                if !active.insert(hint.device) {
+                    continue;
+                }
+            }
+            tracing::info!(peer = %hint.name, addr = %hint.addr, "discovered trusted peer; connecting");
+            match endpoint.connect_any(hint.addr).await {
+                Ok(session) => {
+                    let config = config.clone();
+                    let active = active.clone();
+                    let device = hint.device;
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::session::run(config, session).await {
+                            tracing::warn!(error = %e, "discovered session ended");
+                        }
+                        active.lock().await.remove(&device);
+                    });
+                }
+                Err(e) => {
+                    active.lock().await.remove(&hint.device);
+                    tracing::debug!(error = %e, "dial of discovered peer failed");
+                }
+            }
+        }
+    });
     Ok(())
 }
 
