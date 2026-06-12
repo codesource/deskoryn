@@ -59,6 +59,20 @@ enum Cmd {
     },
     /// List remembered (trusted) devices.
     Devices,
+    /// Send files to a paired peer at host:port.
+    Send {
+        /// Peer address (host:port).
+        addr: String,
+        /// Files or folders to send.
+        #[arg(required = true)]
+        files: Vec<std::path::PathBuf>,
+    },
+    /// Receive one incoming transfer from a paired peer.
+    Receive {
+        /// Destination directory (defaults to the configured download dir).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -87,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Pair { addr, listen } => pair::run(config, paths, addr, listen).await,
+        Cmd::Send { addr, files } => transfer::send_command(config, paths, addr, files).await,
+        Cmd::Receive { dir } => transfer::receive_command(config, paths, dir).await,
         Cmd::Devices => {
             let store = deskoryn_core::trust::TrustStore::load(&paths.trust_file())?;
             for d in &store.devices {

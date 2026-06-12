@@ -55,6 +55,9 @@ pub async fn send_files(session: &dyn Session, tag: StreamTag, roots: &[&Path]) 
         Some(FileXfer::Accept { resume, .. }) => {
             stream_files(&mut sink, tag, &manifest, &resume, roots).await?;
             send_msg(&mut sink, &FileXfer::Complete { tag }).await?;
+            // Wait for the receiver's completion ack so the caller doesn't close
+            // the connection before the reliable stream has actually delivered.
+            let _ = recv_msg(&mut source).await?;
             Ok(())
         }
         Some(FileXfer::Reject { reason, .. }) => {
@@ -122,7 +125,7 @@ pub async fn receive(
         }
         other => anyhow::bail!("expected an Offer, got {other:?}"),
     };
-    let (_tag, manifest) = manifest;
+    let (tag, manifest) = manifest;
 
     tokio::fs::create_dir_all(download_dir).await?;
 
@@ -177,7 +180,113 @@ pub async fn receive(
         }
     }
 
+    // Acknowledge completion so the sender can close cleanly.
+    send_msg(&mut sink, &FileXfer::Complete { tag }).await?;
     Ok(written)
+}
+
+// --- User-facing one-shot commands -----------------------------------------
+
+/// `deskorynd send <addr> <files...>` — connect to a paired peer and send files.
+pub async fn send_command(
+    config: std::sync::Arc<deskoryn_core::config::AppConfig>,
+    paths: deskoryn_core::config::Paths,
+    addr: String,
+    files: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    #[cfg(any(feature = "linux", feature = "windows"))]
+    {
+        send_impl(config, paths, addr, files).await
+    }
+    #[cfg(not(any(feature = "linux", feature = "windows")))]
+    {
+        let _ = (config, paths, addr, files);
+        anyhow::bail!("file transfer requires a real build: rebuild with `--features linux` (or `windows`)")
+    }
+}
+
+/// `deskorynd receive` — accept one incoming transfer from a paired peer.
+pub async fn receive_command(
+    config: std::sync::Arc<deskoryn_core::config::AppConfig>,
+    paths: deskoryn_core::config::Paths,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    #[cfg(any(feature = "linux", feature = "windows"))]
+    {
+        receive_impl(config, paths, dir).await
+    }
+    #[cfg(not(any(feature = "linux", feature = "windows")))]
+    {
+        let _ = (config, paths, dir);
+        anyhow::bail!("file transfer requires a real build: rebuild with `--features linux` (or `windows`)")
+    }
+}
+
+#[cfg(any(feature = "linux", feature = "windows"))]
+async fn send_impl(
+    config: std::sync::Arc<deskoryn_core::config::AppConfig>,
+    paths: deskoryn_core::config::Paths,
+    addr: String,
+    files: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    use deskoryn_core::trust::TrustStore;
+    use deskoryn_net::quic::{DeviceIdentity, QuicEndpoint};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let identity = Arc::new(DeviceIdentity::load_or_generate(
+        config.device.id,
+        &paths.cert_file(),
+        &paths.key_file(),
+    )?);
+    let trust = Arc::new(Mutex::new(TrustStore::load(&paths.trust_file())?));
+    let endpoint = QuicEndpoint::bind(0, identity, trust).await?;
+
+    let socket = addr.parse().map_err(|e| anyhow::anyhow!("invalid address: {e}"))?;
+    println!("Connecting to {addr} …");
+    let session = endpoint.connect_any(socket).await?;
+    let refs: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
+    println!("Sending {} item(s) …", refs.len());
+    send_files(session.as_ref(), 1, &refs).await?;
+    session.close("transfer complete").await;
+    println!("Done.");
+    Ok(())
+}
+
+#[cfg(any(feature = "linux", feature = "windows"))]
+async fn receive_impl(
+    config: std::sync::Arc<deskoryn_core::config::AppConfig>,
+    paths: deskoryn_core::config::Paths,
+    dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    use deskoryn_core::trust::TrustStore;
+    use deskoryn_net::quic::{DeviceIdentity, QuicEndpoint};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    let identity = Arc::new(DeviceIdentity::load_or_generate(
+        config.device.id,
+        &paths.cert_file(),
+        &paths.key_file(),
+    )?);
+    let trust = Arc::new(Mutex::new(TrustStore::load(&paths.trust_file())?));
+    let endpoint = QuicEndpoint::bind(config.network.listen_port, identity, trust).await?;
+
+    let download = dir
+        .or_else(|| config.file_transfer.download_dir.clone())
+        .unwrap_or_else(|| std::env::temp_dir().join("deskoryn-received"));
+    println!(
+        "Waiting for a transfer on port {} → {}",
+        endpoint.local_port(),
+        download.display()
+    );
+    let session = endpoint.accept().await?;
+    let got = receive(session.as_ref(), &download, config.file_transfer.conflict_policy).await?;
+    println!("Received {} file(s):", got.len());
+    for p in &got {
+        println!("  {}", p.display());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
