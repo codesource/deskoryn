@@ -134,3 +134,72 @@ impl ClipboardMonitor for MemoryClipboard {
 pub fn open() -> Result<Box<dyn ClipboardMonitor>, ClipboardError> {
     Ok(Box::new(MemoryClipboard::new()))
 }
+
+/// Real OS clipboard via `arboard`, behind the `*-backend` features.
+///
+/// Compile-verified; runtime needs a desktop session (X11/Wayland display or the
+/// Windows clipboard). Text is fully supported; image/file formats are a TODO.
+#[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+pub mod system {
+    use super::*;
+
+    /// [`ClipboardAccess`] over the OS clipboard. Echo-suppressed: the content we
+    /// `write` is remembered so the poller (see [`watch`]) doesn't re-offer it.
+    pub struct SystemClipboard {
+        last_written: Arc<StdMutex<Option<String>>>,
+    }
+
+    impl ClipboardAccess for SystemClipboard {
+        fn read(&self, format: ClipFormat) -> Option<ClipPayload> {
+            match format {
+                ClipFormat::Utf8Text => arboard::Clipboard::new().ok()?.get_text().ok().map(ClipPayload::Text),
+                // TODO(impl): images via arboard get_image() (RGBA <-> PNG with the
+                // `image` crate); file lists via the OS file-clipboard formats.
+                _ => None,
+            }
+        }
+
+        fn write(&self, payload: ClipPayload) {
+            if let ClipPayload::Text(text) = payload {
+                if let Ok(mut cb) = arboard::Clipboard::new() {
+                    if cb.set_text(text.clone()).is_ok() {
+                        *self.last_written.lock().unwrap() = Some(text);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Build the system clipboard access plus a change stream produced by polling
+    /// (arboard exposes no change events). Polling skips content we wrote
+    /// ourselves so there is no echo.
+    pub fn watch(poll: std::time::Duration) -> (Arc<SystemClipboard>, mpsc::UnboundedReceiver<LocalClip>) {
+        let last_written = Arc::new(StdMutex::new(None::<String>));
+        let access = Arc::new(SystemClipboard { last_written: last_written.clone() });
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let mut last_seen: Option<String> = None;
+            let mut seq: u64 = 0;
+            loop {
+                tokio::time::sleep(poll).await;
+                let Ok(mut cb) = arboard::Clipboard::new() else { continue };
+                let Ok(text) = cb.get_text() else { continue };
+                if last_seen.as_deref() == Some(text.as_str()) {
+                    continue; // unchanged
+                }
+                last_seen = Some(text.clone());
+                // Suppress our own writes (echo).
+                if last_written.lock().unwrap().as_deref() == Some(text.as_str()) {
+                    continue;
+                }
+                seq += 1;
+                if tx.send(LocalClip { seq, formats: vec![ClipFormat::Utf8Text] }).is_err() {
+                    break;
+                }
+            }
+        });
+
+        (access, rx)
+    }
+}

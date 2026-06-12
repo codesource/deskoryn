@@ -8,8 +8,10 @@ license.workspace = true
 
 [features]
 default = []
-linux-backend = []
-windows-backend = []
+# A real OS clipboard via `arboard` (cross-platform: X11/Wayland, Windows,
+# macOS). Both per-OS feature names map to it.
+linux-backend = ["dep:arboard"]
+windows-backend = ["dep:arboard"]
 
 [dependencies]
 deskoryn-core.workspace = true
@@ -18,3 +20,4 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+arboard = { version = "3", optional = true }
