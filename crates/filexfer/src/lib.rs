@@ -23,6 +23,7 @@
 pub mod manifest;
 pub mod progress;
 pub mod sink;
+pub mod sync;
 
 use deskoryn_core::config::ConflictPolicy;
 use std::path::{Path, PathBuf};

@@ -70,6 +70,37 @@ mod tests {
     use super::*;
     use crate::message::ProtocolVersion;
 
+    use crate::message::{AudioFrame, Control};
+
+    /// The decoders must never panic on malformed input — only return Err/None.
+    /// A deterministic pseudo-random sweep stands in for a fuzzer on stable
+    /// (see `fuzz/` for the libFuzzer target).
+    #[test]
+    fn decoders_never_panic_on_garbage() {
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = || {
+            // xorshift64* — deterministic, no clock/rng dependency.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545F4914F6CDD1D)
+        };
+
+        for _ in 0..5_000 {
+            let len = (next() % 64) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| (next() & 0xff) as u8).collect();
+
+            // Stream framing: feed raw bytes (which include a length prefix view).
+            let mut buf = BytesMut::from(&bytes[..]);
+            let _ = decode_one::<Control>(&mut buf); // must not panic
+            let _ = decode_one::<AudioFrame>(&mut buf);
+
+            // Datagram decoding of arbitrary bytes.
+            let _ = from_datagram::<AudioFrame>(&bytes);
+            let _ = from_datagram::<Control>(&bytes);
+        }
+    }
+
     #[test]
     fn round_trip_and_partial() {
         let mut buf = BytesMut::new();

@@ -1,0 +1,29 @@
+# Deskoryn user service (systemd --user).
+#
+# Runs inside the graphical login session so it has access to the input devices,
+# clipboard, and display portals. Install per-user:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp packaging/systemd/deskoryn.service ~/.config/systemd/user/
+#   # adjust ExecStart to the installed binary path
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now deskoryn.service
+#
+# (A *user* service, not a system one, is required: input capture/injection and
+#  the clipboard need the user's session — see docs/OS_PROBLEMS.md F3.)
+
+[Unit]
+Description=Deskoryn unified-workstation daemon
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/deskorynd run
+Restart=on-failure
+RestartSec=2
+# Tighten a little without breaking device/portal access.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

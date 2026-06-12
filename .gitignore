@@ -11,6 +11,12 @@
 /ui/dist
 /ui/src-tauri/target
 
+# Fuzzing (cargo-fuzz) artifacts
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock
+
 # OS cruft
 .DS_Store
 Thumbs.db

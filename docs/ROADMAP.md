@@ -105,10 +105,13 @@ reverse direction.
 
 ## M6 — Tray UI + autostart + polish
 
-- Tauri tray app: status, monitor arranger, pairing dialog, device list,
-  per-feature toggles, transfer progress (see `docs/UI.md`).
-- Autostart: systemd user service (Linux), Windows Service + auto-login start.
-- Reconnect/offline UX, structured logs, crash recovery.
+- ✅ Local control socket (`ipc::serve`/`request`) + `deskorynd status` CLI
+  client over it; UI scaffold in `ui/` describing the Tauri app's use of the
+  same protocol.
+- ✅ Autostart artifacts: systemd user service + udev rule (`packaging/`).
+- ⬜ The Tauri GUI itself (status, monitor arranger, pairing dialog, device
+  list, transfer progress) — scaffold present; needs node + webkit to build.
+- ⬜ Live connection state in the status handler; Windows Service registration.
 
 **Exit:** install → log in → it just works, configured entirely from the tray.
 
@@ -116,8 +119,13 @@ reverse direction.
 
 ## M7 — Optional shared folders & hardening
 
-- Two-way folder sync (Syncthing-style block reuse) with conflict handling.
-- Resource limits, fuzzing of the wire decoder, packaging (`.deb`/MSI), signing.
+- ✅ Shared-folder sync planning (`filexfer::sync::plan`): push/pull/conflict/
+  in-sync resolution by hash + mtime, one-way or bidirectional. Unit-tested.
+- ✅ Wire-decoder hardening: a stable "never panic on garbage" sweep plus a
+  cargo-fuzz target (`fuzz/`).
+- ✅ Packaging/autostart scaffolds (`packaging/`).
+- ⬜ Sync *execution* wired to the transfer pump; resource limits; `.deb`/MSI
+  packaging + signing.
 
 ---
 

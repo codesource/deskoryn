@@ -1,0 +1,15 @@
+# Deskoryn input access (Linux evdev/uinput backend).
+#
+# Grants the `input` group read access to event devices and read/write to
+# /dev/uinput, so deskorynd can capture and inject without running as root.
+#
+# Install:
+#   sudo cp packaging/udev/99-deskoryn.rules /etc/udev/rules.d/
+#   sudo groupadd -f input && sudo usermod -aG input "$USER"
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # log out/in for the group change to take effect
+#
+# See docs/OS_PROBLEMS.md A2.
+
+KERNEL=="uinput", GROUP="input", MODE="0660", OPTIONS+="static_node=uinput"
+KERNEL=="event*", SUBSYSTEM=="input", GROUP="input", MODE="0640"

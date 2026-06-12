@@ -1,0 +1,31 @@
+# libFuzzer harness for the Deskoryn wire decoder. Run with cargo-fuzz on a
+# nightly toolchain (NOT part of the stable workspace build):
+#
+#   rustup toolchain install nightly
+#   cargo install cargo-fuzz
+#   cargo +nightly fuzz run decode
+#
+# Intentionally excluded from the workspace (see the root Cargo.toml members).
+[package]
+name = "deskoryn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+deskoryn-proto = { path = "../crates/proto" }
+
+[[bin]]
+name = "decode"
+path = "fuzz_targets/decode.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+# Empty: keep this a standalone workspace so the stable build never pulls it in.
