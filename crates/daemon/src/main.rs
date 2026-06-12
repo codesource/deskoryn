@@ -13,6 +13,7 @@
 //! the per-feature logic lives in the respective crates. The whole thing runs
 //! end-to-end today over the in-memory loopback session (`--dry-run`).
 
+mod audio;
 mod clipboard;
 mod control;
 mod focus;

@@ -41,6 +41,11 @@ impl JitterBuffer {
         }
     }
 
+    /// Number of packets currently buffered (used to drain at end-of-stream).
+    pub fn buffered(&self) -> usize {
+        self.pending.len()
+    }
+
     pub fn push(&mut self, seq: u32, packet: Vec<u8>) {
         // Drop packets older than what we've already played out.
         if self.started && seq < self.next_seq {

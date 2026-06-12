@@ -32,6 +32,17 @@ pub fn encode<T: Serialize>(msg: &T, out: &mut BytesMut) -> Result<(), FrameErro
     Ok(())
 }
 
+/// Encode a message for an unreliable **datagram** (no length prefix — the
+/// datagram boundary is the message boundary). Used for audio frames.
+pub fn to_datagram<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
+    postcard::to_allocvec(msg).map_err(FrameError::Encode)
+}
+
+/// Decode a message from a single datagram.
+pub fn from_datagram<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, FrameError> {
+    postcard::from_bytes(bytes).map_err(FrameError::Decode)
+}
+
 /// Try to decode one frame from the front of `buf`.
 ///
 /// Returns `Ok(Some(msg))` and consumes the frame when a full one is buffered,

@@ -33,3 +33,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true

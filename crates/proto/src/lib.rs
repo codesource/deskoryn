@@ -23,7 +23,7 @@
 pub mod framing;
 pub mod message;
 
-pub use framing::{decode_one, encode, FrameError};
+pub use framing::{decode_one, encode, from_datagram, to_datagram, FrameError};
 pub use message::*;
 
 /// Bump on any breaking change to the message schema. The handshake refuses to
