@@ -135,6 +135,15 @@ pub enum FileXfer {
     /// Accept (optionally resuming each file from an offset) or reject.
     Accept { tag: StreamTag, resume: Vec<FileResume> },
     Reject { tag: StreamTag, reason: String },
+    /// A run of bytes for `file_index` starting at `offset`. (In a future
+    /// revision these move to a dedicated per-transfer stream for parallelism;
+    /// carried on the FileXfer channel here so they ride the `Session` API.)
+    Chunk {
+        tag: StreamTag,
+        file_index: u32,
+        offset: u64,
+        data: Vec<u8>,
+    },
     /// Sender's progress heartbeat (also derivable from bytes received, but this
     /// lets the receiver show progress before the first chunk of a huge file).
     Progress { tag: StreamTag, file_index: u32, bytes_done: u64 },

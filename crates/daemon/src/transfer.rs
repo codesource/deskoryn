@@ -1,0 +1,233 @@
+//! File-transfer pump: drive a [`FileXfer`] exchange over a session channel.
+//!
+//! The *logic* (manifest building, chunked writing, hashing, resume, conflict
+//! handling, progress) lives in `deskoryn-filexfer`; this module wires it to the
+//! wire protocol and the [`Session`] FileXfer channel.
+//!
+//! Two entry points:
+//! * [`send_files`] — offer a set of paths and stream their bytes.
+//! * [`receive`] — accept an offer and write the files to a download dir.
+
+// Wired to the UI/drag-drop and shared-folder triggers in a later milestone;
+// exercised today by the integration test below and usable from the session
+// pump once those triggers land.
+#![allow(dead_code)]
+
+use bytes::BytesMut;
+use deskoryn_core::config::ConflictPolicy;
+use deskoryn_filexfer::manifest;
+use deskoryn_filexfer::progress::ProgressTracker;
+use deskoryn_filexfer::sink::FileSink;
+use deskoryn_net::transport::{Session, Sink, Source};
+use deskoryn_proto::{decode_one, encode, Channel, FileXfer, StreamTag};
+use std::path::{Path, PathBuf};
+
+/// Bytes per `Chunk`. 64 KiB balances framing overhead against memory.
+const CHUNK: usize = 64 * 1024;
+
+async fn send_msg(sink: &mut Box<dyn Sink>, msg: &FileXfer) -> anyhow::Result<()> {
+    let mut buf = BytesMut::new();
+    encode(msg, &mut buf)?;
+    sink.send_bytes(&buf).await?;
+    Ok(())
+}
+
+async fn recv_msg(source: &mut Box<dyn Source>) -> anyhow::Result<Option<FileXfer>> {
+    match source.recv_bytes().await? {
+        Some(frame) => {
+            let mut b = BytesMut::from(&frame[..]);
+            Ok(decode_one::<FileXfer>(&mut b)?)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Offer `roots` to the peer and stream their contents. Returns when the peer
+/// has acknowledged the whole set (or rejected it).
+pub async fn send_files(session: &dyn Session, tag: StreamTag, roots: &[&Path]) -> anyhow::Result<()> {
+    let manifest = tokio::task::block_in_place(|| manifest::build(roots))?;
+    let (mut sink, mut source) = session.channel(Channel::FileXfer).await?;
+
+    send_msg(&mut sink, &FileXfer::Offer { tag, manifest: manifest.clone() }).await?;
+
+    // Await Accept / Reject.
+    match recv_msg(&mut source).await? {
+        Some(FileXfer::Accept { resume, .. }) => {
+            stream_files(&mut sink, tag, &manifest, &resume, roots).await?;
+            send_msg(&mut sink, &FileXfer::Complete { tag }).await?;
+            Ok(())
+        }
+        Some(FileXfer::Reject { reason, .. }) => {
+            anyhow::bail!("peer rejected transfer: {reason}")
+        }
+        other => anyhow::bail!("unexpected reply to offer: {other:?}"),
+    }
+}
+
+async fn stream_files(
+    sink: &mut Box<dyn Sink>,
+    tag: StreamTag,
+    manifest: &deskoryn_proto::Manifest,
+    resume: &[deskoryn_proto::FileResume],
+    roots: &[&Path],
+) -> anyhow::Result<()> {
+    // The manifest's rel_paths are relative to each root's parent; reconstruct
+    // the absolute source path the same way `manifest::build` did.
+    let base = roots.first().and_then(|r| r.parent()).unwrap_or(Path::new("."));
+    for (idx, entry) in manifest.files.iter().enumerate() {
+        if entry.is_dir {
+            continue;
+        }
+        let abs = base.join(&entry.rel_path);
+        let start = resume
+            .iter()
+            .find(|r| r.file_index as usize == idx)
+            .map(|r| r.offset)
+            .unwrap_or(0);
+
+        let bytes = tokio::fs::read(&abs).await?;
+        let mut offset = start as usize;
+        while offset < bytes.len() {
+            let end = (offset + CHUNK).min(bytes.len());
+            send_msg(
+                sink,
+                &FileXfer::Chunk {
+                    tag,
+                    file_index: idx as u32,
+                    offset: offset as u64,
+                    data: bytes[offset..end].to_vec(),
+                },
+            )
+            .await?;
+            offset = end;
+        }
+    }
+    Ok(())
+}
+
+/// Accept an incoming offer and write the files under `download_dir`. Returns
+/// the paths written.
+pub async fn receive(
+    session: &dyn Session,
+    download_dir: &Path,
+    policy: ConflictPolicy,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let (mut sink, mut source) = session.channel(Channel::FileXfer).await?;
+
+    let manifest = match recv_msg(&mut source).await? {
+        Some(FileXfer::Offer { tag, manifest }) => {
+            // Accept everything from the start (no resume yet).
+            send_msg(&mut sink, &FileXfer::Accept { tag, resume: vec![] }).await?;
+            (tag, manifest)
+        }
+        other => anyhow::bail!("expected an Offer, got {other:?}"),
+    };
+    let (_tag, manifest) = manifest;
+
+    tokio::fs::create_dir_all(download_dir).await?;
+
+    // Resolve destinations up front (creating directories), so chunks can be
+    // routed by file_index. `dests[i]` is None for directories / skipped files.
+    let mut dests: Vec<Option<PathBuf>> = Vec::with_capacity(manifest.files.len());
+    for entry in &manifest.files {
+        let intended = download_dir.join(&entry.rel_path);
+        if entry.is_dir {
+            tokio::fs::create_dir_all(&intended).await?;
+            dests.push(None);
+            continue;
+        }
+        let resolved = deskoryn_filexfer::resolve_conflict(download_dir, &intended, policy)?;
+        dests.push(resolved);
+    }
+
+    let mut sinks: Vec<Option<FileSink>> = (0..manifest.files.len()).map(|_| None).collect();
+    let mut tracker = ProgressTracker::new(0, manifest.total_bytes, manifest.files.len() as u32);
+    let mut written = Vec::new();
+
+    loop {
+        match recv_msg(&mut source).await? {
+            Some(FileXfer::Chunk { file_index, offset, data, .. }) => {
+                let i = file_index as usize;
+                let Some(Some(dest)) = dests.get(i).cloned() else {
+                    continue; // directory or skipped
+                };
+                if sinks[i].is_none() {
+                    sinks[i] = Some(FileSink::create(&dest, 0)?);
+                }
+                let fs = sinks[i].as_mut().unwrap();
+                fs.write_chunk(offset, &data)?;
+                tracker.advance(data.len() as u64);
+            }
+            Some(FileXfer::Complete { .. }) => break,
+            Some(FileXfer::Cancel { reason, .. }) => anyhow::bail!("transfer cancelled: {reason}"),
+            Some(other) => tracing::debug!(?other, "unexpected file-transfer message"),
+            None => anyhow::bail!("peer closed mid-transfer"),
+        }
+    }
+
+    // Finalize each opened file (verifying hash where the manifest had one).
+    for (i, slot) in sinks.into_iter().enumerate() {
+        if let Some(fs) = slot {
+            let entry = &manifest.files[i];
+            fs.finish(entry.hash, &entry.rel_path)?;
+            tracker.complete_file();
+            if let Some(Some(dest)) = dests.get(i) {
+                written.push(dest.clone());
+            }
+        }
+    }
+
+    Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deskoryn_core::DeviceId;
+    use deskoryn_net::transport::loopback;
+    use std::io::Write;
+
+    fn tmpdir(tag: &str) -> PathBuf {
+        // Deterministic, test-local temp dir (no clock/random needed).
+        let base = std::env::temp_dir().join(format!("deskoryn-xfer-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transfers_a_directory_tree() {
+        // Build a source tree: src/a.txt, src/sub/b.bin
+        let root = tmpdir("src");
+        let src = root.join("payload");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"hello deskoryn").unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::File::create(src.join("sub/b.bin")).unwrap().write_all(&big).unwrap();
+
+        let dl = tmpdir("dl");
+
+        let (sa, sb) = loopback::loopback(DeviceId::from_bytes([1; 16]), DeviceId::from_bytes([2; 16]));
+        let sa: Box<dyn Session> = Box::new(sa);
+        let sb: Box<dyn Session> = Box::new(sb);
+
+        let src_for_send = src.clone();
+        let sender = tokio::spawn(async move {
+            send_files(sa.as_ref(), 1, &[src_for_send.as_path()]).await
+        });
+
+        let dl_for_recv = dl.clone();
+        let received = receive(sb.as_ref(), &dl_for_recv, ConflictPolicy::Rename).await.unwrap();
+        sender.await.unwrap().unwrap();
+
+        // Two files received with identical contents.
+        assert_eq!(received.len(), 2);
+        let got_a = std::fs::read(dl.join("payload/a.txt")).unwrap();
+        assert_eq!(got_a, b"hello deskoryn");
+        let got_b = std::fs::read(dl.join("payload/sub/b.bin")).unwrap();
+        assert_eq!(got_b, big);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dl);
+    }
+}

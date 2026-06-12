@@ -19,6 +19,7 @@ mod ipc;
 mod pair;
 mod session;
 mod supervisor;
+mod transfer;
 
 use clap::{Parser, Subcommand};
 use deskoryn_core::config::{AppConfig, Paths};
