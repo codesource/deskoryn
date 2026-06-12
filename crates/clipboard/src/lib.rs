@@ -42,6 +42,17 @@ pub struct LocalClip {
     pub formats: Vec<ClipFormat>,
 }
 
+/// The pump-facing slice of clipboard capability: synchronous read/write of the
+/// current local clipboard content. Real backends implement this over the OS
+/// clipboard; [`platform::MemClipboard`] implements it in memory for tests. The
+/// *change notification* is delivered separately (a channel of [`LocalClip`]) so
+/// the pump can `select!` over "local changed" and "peer message" without
+/// aliasing a single mutable handle.
+pub trait ClipboardAccess: Send + Sync {
+    fn read(&self, format: ClipFormat) -> Option<ClipPayload>;
+    fn write(&self, payload: ClipPayload);
+}
+
 /// Observe and read/write the local OS clipboard.
 #[async_trait]
 pub trait ClipboardMonitor: Send {
