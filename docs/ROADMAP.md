@@ -61,11 +61,17 @@ daily-usable build.**
 
 ---
 
+> **Note:** the protocol + pump *logic* for M3/M4/M5 has already landed and is
+> tested over the loopback session (ahead of M2). What remains for each is the
+> OS-native backend (real clipboard / filesystem triggers / audio devices),
+> which needs a graphical session and hardware to validate.
+
 ## M3 — Global clipboard
 
-- Text + image sync with delayed rendering and echo suppression.
-- Linux: `wlr-data-control`/portal + X11 selections (`INCR`). Windows: Clipboard
-  API + `WM_RENDERFORMAT`.
+- ✅ Clipboard sync pump (`daemon::clipboard`): inline small text, delayed
+  rendering (`Pull`) for other formats, echo suppression. Tested both directions.
+- ⬜ OS backends — Linux: `wlr-data-control`/portal + X11 selections (`INCR`);
+  Windows: Clipboard API + `WM_RENDERFORMAT`; image + file-list formats.
 
 **Exit:** copy text/image on one machine, paste on the other, both directions.
 
@@ -73,9 +79,11 @@ daily-usable build.**
 
 ## M4 — File transfer
 
-- Drag-and-drop between machines; file-clipboard paste (`CF_HDROP` ⇄ file list).
-- Background transfer service: manifests, chunk streams, resume, conflict policy.
-- Tray progress for large transfers.
+- ✅ Transfer pump (`daemon::transfer`): manifest → accept → `Chunk` stream →
+  complete, with hashing, conflict policy, resume offsets, path-traversal guard,
+  progress. Tested transferring a directory tree over the session.
+- ⬜ Drag-and-drop + file-clipboard paste (`CF_HDROP` ⇄ file list) triggers;
+  tray progress UI; dedicated per-transfer streams for parallelism.
 
 **Exit:** drag a folder across the boundary; it lands with names/metadata intact,
 resumes after an interruption, shows progress.
@@ -84,9 +92,11 @@ resumes after an interruption, shows progress.
 
 ## M5 — Audio forwarding
 
-- WASAPI loopback (Windows) / PipeWire monitor + virtual sink (Linux).
-- Opus encode/decode (`opus` feature), datagram transport, jitter buffer.
-- Profile switch (low-latency vs high-quality); source/sink device pickers.
+- ✅ Audio pipeline (`daemon::audio`): capture → codec → datagrams → jitter
+  buffer (profile-sized, gap-concealing) → playback. Tested with a passthrough
+  codec over the loopback session.
+- ⬜ OS backends — WASAPI loopback (Windows) / PipeWire monitor + virtual sink
+  (Linux); real Opus codec (`opus` feature); device pickers.
 
 **Exit:** Windows audio plays on Linux speakers with selectable latency; optional
 reverse direction.
