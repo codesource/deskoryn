@@ -9,9 +9,9 @@ license.workspace = true
 [features]
 default = []
 # Real codec + OS audio backends, off by default.
-opus = []            # dep:audiopus / opus
-linux-backend = []   # PipeWire capture/playback + virtual sink
-windows-backend = [] # WASAPI loopback capture / render
+opus = ["dep:audiopus"]  # real Opus encode/decode (vendors libopus)
+linux-backend = []        # PipeWire capture/playback + virtual sink
+windows-backend = []      # WASAPI loopback capture / render
 
 [dependencies]
 deskoryn-core.workspace = true
@@ -20,3 +20,4 @@ async-trait.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+audiopus = { version = "0.2", optional = true }
