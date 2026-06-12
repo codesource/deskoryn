@@ -57,6 +57,34 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     let endpoint = Arc::new(QuicEndpoint::bind(config.network.listen_port, identity, trust.clone()).await?);
     tracing::info!(port = endpoint.local_port(), "QUIC endpoint bound");
 
+    // Local control socket for the tray UI / `deskorynd status`.
+    #[cfg(unix)]
+    {
+        use crate::ipc::{self, PeerStatus, UiEvent, UiRequest};
+        let device_name = config.device.name.clone();
+        let peer_names: Vec<String> = trust.lock().await.devices.iter().map(|d| d.name.clone()).collect();
+        let socket = paths.socket_file();
+        let handler: ipc::Handler = std::sync::Arc::new(move |req| match req {
+            UiRequest::Status => vec![UiEvent::Status {
+                device_name: device_name.clone(),
+                // TODO(impl): report live connection state from the session tasks.
+                peers: peer_names
+                    .iter()
+                    .map(|n| PeerStatus { name: n.clone(), connected: false, address: None, latency_ms: None })
+                    .collect(),
+                active: false,
+            }],
+            _ => vec![],
+        });
+        tracing::info!(socket = %socket.display(), "control socket listening");
+        let socket_for_serve = socket.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ipc::serve(socket_for_serve, handler).await {
+                tracing::warn!(error = %e, "control socket ended");
+            }
+        });
+    }
+
     if config.network.discovery_enabled {
         match start_discovery(&config, &endpoint, &trust, identity_fp).await {
             Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),

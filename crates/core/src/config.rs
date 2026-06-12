@@ -52,6 +52,10 @@ impl Paths {
     pub fn cert_file(&self) -> PathBuf {
         self.state_dir.join("device.crt")
     }
+    /// Local control socket (Unix domain socket / named pipe) for the tray/CLI.
+    pub fn socket_file(&self) -> PathBuf {
+        self.state_dir.join("deskorynd.sock")
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

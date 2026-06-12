@@ -73,6 +73,8 @@ enum Cmd {
         #[arg(long)]
         dir: Option<std::path::PathBuf>,
     },
+    /// Query a running daemon over its local control socket.
+    Status,
 }
 
 #[tokio::main]
@@ -103,6 +105,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Pair { addr, listen } => pair::run(config, paths, addr, listen).await,
         Cmd::Send { addr, files } => transfer::send_command(config, paths, addr, files).await,
         Cmd::Receive { dir } => transfer::receive_command(config, paths, dir).await,
+        Cmd::Status => status_command(&paths).await,
         Cmd::Devices => {
             let store = deskoryn_core::trust::TrustStore::load(&paths.trust_file())?;
             for d in &store.devices {
@@ -110,6 +113,39 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
+    }
+}
+
+/// Connect to a running daemon's control socket and print its status.
+async fn status_command(paths: &Paths) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use ipc::{UiEvent, UiRequest};
+        let socket = paths.socket_file();
+        let events = ipc::request(&socket, &UiRequest::Status)
+            .await
+            .map_err(|e| anyhow::anyhow!("no running daemon at {} ({e})", socket.display()))?;
+        for ev in events {
+            if let UiEvent::Status { device_name, peers, active } = ev {
+                println!("device: {device_name}");
+                println!("active: {active}");
+                if peers.is_empty() {
+                    println!("peers:  (none paired)");
+                } else {
+                    println!("peers:");
+                    for p in peers {
+                        let state = if p.connected { "connected" } else { "offline" };
+                        println!("  - {} [{state}]", p.name);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        anyhow::bail!("status over the control socket is currently Unix-only")
     }
 }
 
