@@ -135,17 +135,20 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
 /// peer. Exercises the orchestration without touching the OS or network.
 async fn run_dry(config: Arc<AppConfig>) -> anyhow::Result<()> {
     use deskoryn_net::transport::{loopback, Session};
-    use deskoryn_proto::{Capabilities, Control, PROTOCOL_VERSION};
+    use deskoryn_proto::{Capabilities, PROTOCOL_VERSION};
 
     let me = config.device.id;
     let peer = deskoryn_core::DeviceId::from_bytes([0xEE; 16]);
     let (mine, theirs) = loopback::loopback(me, peer);
 
-    // Pretend the peer is another daemon: echo a Hello back.
+    // Pretend the peer is another daemon: reply to the Hello, answer a couple of
+    // heartbeats, then say goodbye so the dry-run ends cleanly.
     let peer_task = tokio::spawn(async move {
+        use deskoryn_proto::{decode_one, encode, Control};
         let mut buf = bytes::BytesMut::new();
         let (mut sink, mut src) = theirs.channel(deskoryn_proto::Channel::Control).await.unwrap();
-        // Wait for our Hello, then reply.
+
+        // Wait for our Hello, then reply with one.
         if let Ok(Some(frame)) = src.recv_bytes().await {
             tracing::info!(bytes = frame.len(), "synthetic peer received Hello");
             let reply = Control::Hello {
@@ -162,8 +165,27 @@ async fn run_dry(config: Arc<AppConfig>) -> anyhow::Result<()> {
                 },
             };
             buf.clear();
-            deskoryn_proto::encode(&reply, &mut buf).unwrap();
+            encode(&reply, &mut buf).unwrap();
             let _ = sink.send_bytes(&buf).await;
+        }
+
+        // Answer two pings, then bid goodbye.
+        let mut pongs = 0;
+        while let Ok(Some(frame)) = src.recv_bytes().await {
+            let mut b = bytes::BytesMut::from(&frame[..]);
+            if let Ok(Some(Control::Ping { nonce })) = decode_one::<Control>(&mut b) {
+                buf.clear();
+                encode(&Control::Pong { nonce }, &mut buf).unwrap();
+                let _ = sink.send_bytes(&buf).await;
+                tracing::info!(nonce, "synthetic peer ponged");
+                pongs += 1;
+                if pongs >= 2 {
+                    buf.clear();
+                    encode(&Control::Goodbye { reason: "demo complete".into() }, &mut buf).unwrap();
+                    let _ = sink.send_bytes(&buf).await;
+                    break;
+                }
+            }
         }
     });
 

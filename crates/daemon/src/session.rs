@@ -60,33 +60,19 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
 
     // --- Concurrent channel pumps -------------------------------------------
     //
-    // In the full daemon these run as separate tasks joined here. The skeleton
-    // shows the shape and demonstrates the focus loop with a couple of synthetic
-    // motions so the dry-run does something observable.
+    // Demonstrate the focus logic deterministically, then run the live control
+    // pump (heartbeat + control messages) for the lifetime of the session.
     demo_focus_loop(&mut focus, &peer);
 
-    // TODO(impl): spawn and join:
-    //   - heartbeat: periodic Ping; mark the session dead if no Pong within N.
-    //   - input pump: capture -> focus -> inject / forward (see below).
+    // TODO(impl): additionally spawn and join the latency-critical pumps:
+    //   - input pump: capture -> focus -> inject / forward.
     //   - clipboard pump: ClipboardMonitor::next_change -> Offer; handle Pull.
     //   - filexfer pump: accept Offers, stream chunks, report Progress.
     //   - audio pump: capture -> Opus -> datagrams; datagrams -> jitter -> play.
-    //
-    // The input pump is the latency-critical one; sketch:
-    //
-    //   loop select {
-    //     ev = capture.next_event() => match focus.on_motion(...) {
-    //        MoveLocal(p)  => injector.warp_to(p),
-    //        HandOff{to,entry,mods} => { send Input::Enter{entry,mods}; capture.set_grabbed(true) }
-    //        ...
-    //     },
-    //     frame = input_rx.recv_bytes() => match decode {
-    //        Input::Enter{entry,..} => { focus.on_enter(entry); capture.set_grabbed(false); injector.warp_to(entry) }
-    //        Input::Events{events,..} => for e in events { injector.inject(e) }
-    //     }
-    //   }
 
-    tracing::info!(%peer, role = ?focus.role(), "session ready (skeleton)");
+    tracing::info!(%peer, role = ?focus.role(), "session ready; starting heartbeat");
+    let end = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default()).await?;
+    tracing::info!(%peer, ?end, "session ended");
     Ok(())
 }
 
