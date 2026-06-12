@@ -81,6 +81,7 @@ pub struct PeerStatus {
 // Windows — TODO). The daemon serves; the tray UI / `deskorynctl` connect.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

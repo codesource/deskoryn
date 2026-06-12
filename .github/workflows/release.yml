@@ -1,0 +1,53 @@
+# Build release binaries for Linux and Windows.
+#
+# - Push to a tag like `v0.1.0` to attach binaries to a GitHub Release.
+# - Or run manually (workflow_dispatch) to get artifacts.
+#
+# The Windows job builds the native MSVC target on a Windows runner (the most
+# faithful Windows binary); the Linux job builds natively. For a *local* cross
+# build from Linux, use scripts/build-release.sh instead.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p deskoryn-daemon --features linux
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskorynd-linux-x86_64
+          path: target/release/deskorynd
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p deskoryn-daemon --features windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deskorynd-windows-x86_64
+          path: target/release/deskorynd.exe
+
+  release:
+    needs: [linux, windows]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            deskorynd-linux-x86_64/deskorynd
+            deskorynd-windows-x86_64/deskorynd.exe
