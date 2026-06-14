@@ -21,6 +21,7 @@ mod diag;
 mod focus;
 mod input;
 mod ipc;
+mod monitors;
 mod pair;
 mod session;
 mod supervisor;

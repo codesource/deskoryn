@@ -26,6 +26,9 @@ use std::sync::Arc;
 pub enum ArrangeCmd {
     /// Print the current saved layout.
     Show,
+    /// Auto-detect this machine's monitors (X11) and replace its entries in the
+    /// layout. Peer monitors, if any, are left untouched.
+    Detect,
     /// Add a local monitor, positioned absolutely (`--at`) or beside an existing
     /// one (`--right-of`/`--left-of`/`--above`/`--below`). With none of those, it
     /// is placed to the right of the rightmost existing monitor (or at 0,0).
@@ -100,6 +103,21 @@ pub fn run(config: Arc<AppConfig>, config_path: &Path, cmd: ArrangeCmd) -> anyho
         }
         ArrangeCmd::Clear => {
             config.layout.monitors.clear();
+        }
+        ArrangeCmd::Detect => {
+            let detected = crate::monitors::detect()?;
+            // Replace only this device's monitors with the fresh read.
+            config.layout.monitors.retain(|m| m.device() != me);
+            for (i, d) in detected.iter().enumerate() {
+                config.layout.monitors.push(Monitor {
+                    id: MonitorId::new(me, i as u16),
+                    label: d.name.clone(),
+                    bounds: Rect::new(d.x, d.y, d.w, d.h),
+                    native: Size::new(d.w, d.h),
+                    scale_pct: 100,
+                });
+            }
+            println!("detected {} monitor(s)", detected.len());
         }
         ArrangeCmd::Remove { label } => {
             let before = config.layout.monitors.len();
