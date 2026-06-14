@@ -296,10 +296,12 @@ pub async fn run_input(
                     match action {
                         Action::PassThrough => {}
                         Action::Enter { at, mods } => {
+                            tracing::debug!(?at, "cursor crossed onto peer; grabbing local input");
                             send(&mut sink, &Input::Enter { entry: at, mods }).await?;
                             capture.set_grabbed(true).await?;
                         }
                         Action::Leave => {
+                            tracing::debug!("cursor returned to local; releasing input");
                             send(&mut sink, &Input::Leave).await?;
                             capture.set_grabbed(false).await?;
                         }
@@ -309,6 +311,10 @@ pub async fn run_input(
                         }
                     }
                 }
+                // Position trace (enable with `RUST_LOG=deskoryn=trace`) — shows the
+                // tracked cursor climbing toward the boundary so a missed handoff
+                // (e.g. startup desync) is visible.
+                tracing::trace!(pos = ?controller.position(), grabbed = controller.grabbed(), "cursor state");
             }
             frame = source.recv_bytes() => {
                 let Some(frame) = frame? else { return Ok(()); };
