@@ -42,10 +42,25 @@ pub fn detect() -> anyhow::Result<Vec<MonitorInfo>> {
     Ok(mons)
 }
 
-/// Auto-detect isn't wired for non-Linux hosts yet.
-#[cfg(not(target_os = "linux"))]
+/// Detect this machine's active monitors via the Windows display API
+/// (`EnumDisplayMonitors`, in `deskoryn-input`). Coordinates are in Windows'
+/// virtual-screen space (primary at 0,0); the arranger offsets them into the
+/// shared desktop (`arrange detect --offset-x`).
+#[cfg(all(target_os = "windows", feature = "windows"))]
 pub fn detect() -> anyhow::Result<Vec<MonitorInfo>> {
-    anyhow::bail!("monitor auto-detect is currently Linux/X11 only; add monitors manually with `arrange add`")
+    let rects = deskoryn_input::monitors::detect()
+        .map_err(|e| anyhow::anyhow!("monitor detection failed: {e}"))?;
+    Ok(rects
+        .into_iter()
+        .map(|r| MonitorInfo { name: r.name, x: r.x, y: r.y, w: r.w, h: r.h })
+        .collect())
+}
+
+/// Auto-detect isn't wired for this host/build (e.g. Wayland, or a Windows build
+/// without the `windows` feature).
+#[cfg(not(any(target_os = "linux", all(target_os = "windows", feature = "windows"))))]
+pub fn detect() -> anyhow::Result<Vec<MonitorInfo>> {
+    anyhow::bail!("monitor auto-detect needs Linux/X11 or a Windows build; add monitors manually with `arrange add`")
 }
 
 /// Parse the connected, active outputs out of `xrandr --query` output.

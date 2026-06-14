@@ -22,6 +22,8 @@
 
 pub mod hotkey;
 pub mod keymap;
+#[cfg(all(target_os = "windows", feature = "windows-backend"))]
+pub mod monitors;
 pub mod platform;
 
 use async_trait::async_trait;

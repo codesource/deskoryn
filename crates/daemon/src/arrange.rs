@@ -26,9 +26,18 @@ use std::sync::Arc;
 pub enum ArrangeCmd {
     /// Print the current saved layout.
     Show,
-    /// Auto-detect this machine's monitors (X11) and replace its entries in the
-    /// layout. Peer monitors, if any, are left untouched.
-    Detect,
+    /// Auto-detect this machine's monitors (X11 / Windows) and replace its
+    /// entries in the layout. Peer monitors, if any, are left untouched.
+    Detect {
+        /// Shift every detected monitor right by this many pixels, to place this
+        /// machine beside the peer in the shared desktop (e.g. the Windows side
+        /// uses `--offset-x 5760` to sit right of a 3×1920 Linux row).
+        #[arg(long, default_value_t = 0)]
+        offset_x: i32,
+        /// Shift every detected monitor down by this many pixels.
+        #[arg(long, default_value_t = 0)]
+        offset_y: i32,
+    },
     /// Add a local monitor, positioned absolutely (`--at`) or beside an existing
     /// one (`--right-of`/`--left-of`/`--above`/`--below`). With none of those, it
     /// is placed to the right of the rightmost existing monitor (or at 0,0).
@@ -104,7 +113,7 @@ pub fn run(config: Arc<AppConfig>, config_path: &Path, cmd: ArrangeCmd) -> anyho
         ArrangeCmd::Clear => {
             config.layout.monitors.clear();
         }
-        ArrangeCmd::Detect => {
+        ArrangeCmd::Detect { offset_x, offset_y } => {
             let detected = crate::monitors::detect()?;
             // Replace only this device's monitors with the fresh read.
             config.layout.monitors.retain(|m| m.device() != me);
@@ -112,7 +121,7 @@ pub fn run(config: Arc<AppConfig>, config_path: &Path, cmd: ArrangeCmd) -> anyho
                 config.layout.monitors.push(Monitor {
                     id: MonitorId::new(me, i as u16),
                     label: d.name.clone(),
-                    bounds: Rect::new(d.x, d.y, d.w, d.h),
+                    bounds: Rect::new(d.x + offset_x, d.y + offset_y, d.w, d.h),
                     native: Size::new(d.w, d.h),
                     scale_pct: 100,
                 });
