@@ -59,6 +59,37 @@ mod ev {
     pub const DELETE: u32 = 111;
     pub const LEFTMETA: u32 = 125;
     pub const RIGHTMETA: u32 = 126;
+
+    // Numpad (note: evdev's keypad digits are not in numeric order).
+    pub const KPASTERISK: u32 = 55;
+    pub const KP7: u32 = 71;
+    pub const KP8: u32 = 72;
+    pub const KP9: u32 = 73;
+    pub const KPMINUS: u32 = 74;
+    pub const KP4: u32 = 75;
+    pub const KP5: u32 = 76;
+    pub const KP6: u32 = 77;
+    pub const KPPLUS: u32 = 78;
+    pub const KP1: u32 = 79;
+    pub const KP2: u32 = 80;
+    pub const KP3: u32 = 81;
+    pub const KP0: u32 = 82;
+    pub const KPDOT: u32 = 83;
+    pub const KPSLASH: u32 = 98;
+
+    // System / editing.
+    pub const SYSRQ: u32 = 99; // Print Screen
+    pub const PAUSE: u32 = 119;
+    pub const COMPOSE: u32 = 127; // Menu / Apps key
+
+    // Media.
+    pub const MUTE: u32 = 113;
+    pub const VOLUMEDOWN: u32 = 114;
+    pub const VOLUMEUP: u32 = 115;
+    pub const NEXTSONG: u32 = 163;
+    pub const PLAYPAUSE: u32 = 164;
+    pub const PREVIOUSSONG: u32 = 165;
+    pub const STOPCD: u32 = 166;
 }
 
 /// Windows virtual-key codes (`winuser.h`).
@@ -101,6 +132,28 @@ mod vk {
     pub const OEM_5: u16 = 0xDC; // \|
     pub const OEM_6: u16 = 0xDD; // ]}
     pub const OEM_7: u16 = 0xDE; // '"
+
+    // Numpad (`VK_NUMPAD0..9` == 0x60..0x69).
+    pub const NUMPAD0: u16 = 0x60;
+    pub const MULTIPLY: u16 = 0x6A;
+    pub const ADD: u16 = 0x6B;
+    pub const SUBTRACT: u16 = 0x6D;
+    pub const DECIMAL: u16 = 0x6E;
+    pub const DIVIDE: u16 = 0x6F;
+
+    // System / editing.
+    pub const PAUSE: u16 = 0x13;
+    pub const SNAPSHOT: u16 = 0x2C; // Print Screen
+    pub const APPS: u16 = 0x5D; // Menu key
+
+    // Media.
+    pub const VOLUME_MUTE: u16 = 0xAD;
+    pub const VOLUME_DOWN: u16 = 0xAE;
+    pub const VOLUME_UP: u16 = 0xAF;
+    pub const MEDIA_NEXT_TRACK: u16 = 0xB0;
+    pub const MEDIA_PREV_TRACK: u16 = 0xB1;
+    pub const MEDIA_STOP: u16 = 0xB2;
+    pub const MEDIA_PLAY_PAUSE: u16 = 0xB3;
 }
 
 /// Explicit (evdev, vk) pairs for keys that aren't covered by the contiguous
@@ -143,6 +196,34 @@ const TABLE: &[(u32, u16)] = &[
     (ev::DELETE, vk::DELETE),
     (ev::LEFTMETA, vk::LWIN),
     (ev::RIGHTMETA, vk::RWIN),
+    // Numpad.
+    (ev::KP0, vk::NUMPAD0),
+    (ev::KP1, vk::NUMPAD0 + 1),
+    (ev::KP2, vk::NUMPAD0 + 2),
+    (ev::KP3, vk::NUMPAD0 + 3),
+    (ev::KP4, vk::NUMPAD0 + 4),
+    (ev::KP5, vk::NUMPAD0 + 5),
+    (ev::KP6, vk::NUMPAD0 + 6),
+    (ev::KP7, vk::NUMPAD0 + 7),
+    (ev::KP8, vk::NUMPAD0 + 8),
+    (ev::KP9, vk::NUMPAD0 + 9),
+    (ev::KPASTERISK, vk::MULTIPLY),
+    (ev::KPPLUS, vk::ADD),
+    (ev::KPMINUS, vk::SUBTRACT),
+    (ev::KPDOT, vk::DECIMAL),
+    (ev::KPSLASH, vk::DIVIDE),
+    // System / editing.
+    (ev::SYSRQ, vk::SNAPSHOT),
+    (ev::PAUSE, vk::PAUSE),
+    (ev::COMPOSE, vk::APPS),
+    // Media.
+    (ev::MUTE, vk::VOLUME_MUTE),
+    (ev::VOLUMEDOWN, vk::VOLUME_DOWN),
+    (ev::VOLUMEUP, vk::VOLUME_UP),
+    (ev::NEXTSONG, vk::MEDIA_NEXT_TRACK),
+    (ev::PREVIOUSSONG, vk::MEDIA_PREV_TRACK),
+    (ev::STOPCD, vk::MEDIA_STOP),
+    (ev::PLAYPAUSE, vk::MEDIA_PLAY_PAUSE),
 ];
 
 /// Map an evdev keycode to a Windows virtual-key, or `None` if unmapped.
@@ -250,12 +331,19 @@ mod tests {
         assert_eq!(evdev_to_vk(ev::F12), Some(0x7B)); // F12
         assert_eq!(evdev_to_vk(ev::LEFTMETA), Some(vk::LWIN));
         assert_eq!(evdev_to_vk(0xFFFF), None); // unmapped
+        // Extended set: numpad, media, system.
+        assert_eq!(evdev_to_vk(ev::KP5), Some(0x65)); // VK_NUMPAD5
+        assert_eq!(evdev_to_vk(ev::KPPLUS), Some(vk::ADD));
+        assert_eq!(evdev_to_vk(ev::VOLUMEUP), Some(vk::VOLUME_UP));
+        assert_eq!(evdev_to_vk(ev::SYSRQ), Some(vk::SNAPSHOT)); // Print Screen
+        assert_eq!(evdev_to_vk(ev::COMPOSE), Some(vk::APPS)); // Menu
     }
 
     #[test]
     fn round_trips_every_mapped_evdev_code() {
         // Every evdev code we can produce must map back to itself through VK.
-        let codes: Vec<u32> = (1u32..=130).chain([ev::F11, ev::F12]).collect();
+        // Range covers the base set, numpad, system, and the media block (163+).
+        let codes: Vec<u32> = (1u32..=170).chain([ev::F11, ev::F12]).collect();
         for code in codes {
             if let Some(vk) = evdev_to_vk(code) {
                 assert_eq!(
