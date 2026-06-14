@@ -138,6 +138,8 @@ mod linux {
     use evdev::{
         AttributeSet, EventType, InputEvent as EvEvent, InputEventKind, Key, RelativeAxisType,
     };
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::sync::Arc;
     use tokio::sync::{mpsc, watch};
 
     fn io(e: impl std::fmt::Display) -> InputError {
@@ -149,13 +151,17 @@ mod linux {
     pub struct EvdevCapture {
         rx: mpsc::UnboundedReceiver<InputEvent>,
         grab: watch::Sender<bool>,
-        mods: Modifiers,
+        /// Live modifier state ([`Modifiers`] bits), shared with the per-device
+        /// reader tasks so every key event carries the current modifiers and the
+        /// switch/lock hotkeys can match.
+        mods: Arc<AtomicU16>,
     }
 
     impl EvdevCapture {
         pub fn open() -> Result<Self, InputError> {
             let (tx, rx) = mpsc::unbounded_channel();
             let (grab_tx, grab_rx) = watch::channel(false);
+            let mods = Arc::new(AtomicU16::new(0));
             let mut found = 0;
 
             for (_path, dev) in evdev::enumerate() {
@@ -169,7 +175,7 @@ mod linux {
                     Err(_) => continue,
                 };
                 found += 1;
-                spawn_reader(stream, tx.clone(), grab_rx.clone());
+                spawn_reader(stream, tx.clone(), grab_rx.clone(), mods.clone());
             }
 
             if found == 0 {
@@ -177,7 +183,7 @@ mod linux {
                     "no readable input devices (add the user to the `input` group)".into(),
                 ));
             }
-            Ok(Self { rx, grab: grab_tx, mods: Modifiers::empty() })
+            Ok(Self { rx, grab: grab_tx, mods })
         }
     }
 
@@ -185,6 +191,7 @@ mod linux {
         mut stream: evdev::EventStream,
         tx: mpsc::UnboundedSender<InputEvent>,
         mut grab_rx: watch::Receiver<bool>,
+        mods: Arc<AtomicU16>,
     ) {
         tokio::spawn(async move {
             let mut grabbed = false;
@@ -203,6 +210,7 @@ mod linux {
                         match ev {
                             Ok(ev) => {
                                 if let Some(translated) = translate(&ev) {
+                                    let translated = stamp_mods(translated, &mods);
                                     if tx.send(translated).is_err() { break; }
                                 }
                             }
@@ -212,6 +220,34 @@ mod linux {
                 }
             }
         });
+    }
+
+    /// Update the shared modifier state from a key event and stamp the current
+    /// modifiers onto it. Non-key events pass through unchanged.
+    fn stamp_mods(ev: InputEvent, mods: &AtomicU16) -> InputEvent {
+        if let InputEvent::Key { code, pressed, .. } = ev {
+            if let Some(bit) = modifier_bit(code.0) {
+                let mut m = Modifiers(mods.load(Ordering::Relaxed));
+                m.set(bit, pressed);
+                mods.store(m.0, Ordering::Relaxed);
+            }
+            InputEvent::Key { code, pressed, mods: Modifiers(mods.load(Ordering::Relaxed)) }
+        } else {
+            ev
+        }
+    }
+
+    /// Map an evdev modifier keycode to its [`Modifiers`] bit. Left/right pairs
+    /// share a bit, so holding one while releasing the other clears it early — an
+    /// accepted simplification (the hotkey matcher only needs the combined bit).
+    fn modifier_bit(code: u32) -> Option<Modifiers> {
+        match code {
+            29 | 97 => Some(Modifiers::CTRL),   // LEFT/RIGHT CTRL
+            42 | 54 => Some(Modifiers::SHIFT),  // LEFT/RIGHT SHIFT
+            56 | 100 => Some(Modifiers::ALT),   // LEFT/RIGHT ALT
+            125 | 126 => Some(Modifiers::META), // LEFT/RIGHT META (Super)
+            _ => None,
+        }
     }
 
     fn translate(ev: &EvEvent) -> Option<InputEvent> {
@@ -264,7 +300,7 @@ mod linux {
             self.rx.recv().await.ok_or_else(|| InputError::Backend("capture stopped".into()))
         }
         fn modifiers(&self) -> Modifiers {
-            self.mods
+            Modifiers(self.mods.load(Ordering::Relaxed))
         }
     }
 
