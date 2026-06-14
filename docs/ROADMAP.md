@@ -46,18 +46,32 @@ reconnect automatically. No input sharing yet (that's M2).
 
 ---
 
-## M2 — Seamless input (the core feature)
+## M2 — Seamless input (the core feature) 🚧 (code-complete; hardware bring-up pending)
 
-- Linux backend: libei (Wayland) with evdev/uinput fallback; X11 via XTest.
-- Windows backend: Raw Input capture + low-level hooks for suppression;
-  `SendInput` injection.
-- Wire the input pump: capture → `FocusMachine` → inject/forward.
-- Visual layout arranger in a stopgap CLI/JSON until the GUI lands.
-- Hotkeys (switch / lock), focus-follows-mouse, edge resistance.
+- ✅ Input pump wired (`daemon::input`): capture → `Controller` → inject/forward,
+  with `release_all` on `Leave`/disconnect (no stuck keys). Tested over the
+  loopback session.
+- ✅ Hotkeys (switch / lock) + edge resistance in the `Controller` (unit-tested);
+  focus-follows-mouse is the model (the machine under the cursor is active).
+- ✅ Linux backend (`input::platform`): evdev capture + uinput injection (works
+  under X11 and Wayland at the kernel level), with live modifier tracking.
+  Compile-verified; **needs `/dev/uinput` + `input`-group on real hardware to
+  validate** (`deskorynd input-test`).
+- ✅ Windows backend: `WH_MOUSE_LL`/`WH_KEYBOARD_LL` capture + suppression +
+  cursor-recenter + injected-event filtering; `SendInput` injection; evdev↔VK
+  keymap (numpad/media/system, round-trip tested). Cross-compiles for
+  `x86_64-pc-windows-gnu`; **needs a Windows session to validate.**
+- ✅ Stopgap monitor arranger (`deskorynd arrange`): add/remove/clear/show,
+  JSON import/export, relative placement, and `detect` (X11/`xrandr`).
+- ⬜ Live Linux↔Windows bring-up + tuning (recenter feel, keymap gaps, UAC /
+  secure-desktop elevation for injecting into elevated windows).
+- ⬜ libei (Wayland portal) + X11/XTest capture backends; Wayland/Windows monitor
+  detect; absolute-axis uinput device for exact cursor entry on handoff.
 
 **Exit:** cursor and keyboard move seamlessly across all 5 monitors; keyboard
 focus follows the mouse; no stuck keys on disconnect. **This is the first
-daily-usable build.**
+daily-usable build.** The logic and both OS backends exist; reaching the exit
+now means validating + tuning on the two physical machines.
 
 ---
 
