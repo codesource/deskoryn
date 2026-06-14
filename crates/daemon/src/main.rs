@@ -13,9 +13,11 @@
 //! the per-feature logic lives in the respective crates. The whole thing runs
 //! end-to-end today over the in-memory loopback session (`--dry-run`).
 
+mod arrange;
 mod audio;
 mod clipboard;
 mod control;
+mod diag;
 mod focus;
 mod input;
 mod ipc;
@@ -75,6 +77,20 @@ enum Cmd {
     },
     /// Query a running daemon over its local control socket.
     Status,
+    /// Arrange this machine's monitors in the shared virtual desktop.
+    Arrange {
+        #[command(subcommand)]
+        cmd: arrange::ArrangeCmd,
+    },
+    /// Exercise the local input backend in isolation (capture + optional inject).
+    InputTest {
+        /// Seconds to read input for.
+        #[arg(long, default_value_t = 10)]
+        secs: u64,
+        /// Also inject a test cursor wiggle through the virtual device.
+        #[arg(long)]
+        inject: bool,
+    },
 }
 
 #[tokio::main]
@@ -106,6 +122,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Send { addr, files } => transfer::send_command(config, paths, addr, files).await,
         Cmd::Receive { dir } => transfer::receive_command(config, paths, dir).await,
         Cmd::Status => status_command(&paths).await,
+        Cmd::Arrange { cmd } => arrange::run(config, &config_path, cmd),
+        Cmd::InputTest { secs, inject } => diag::input_test(secs, inject).await,
         Cmd::Devices => {
             let store = deskoryn_core::trust::TrustStore::load(&paths.trust_file())?;
             for d in &store.devices {

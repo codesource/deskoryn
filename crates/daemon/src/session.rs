@@ -47,7 +47,8 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
     // Build the input controller over the combined virtual desktop, starting the
     // cursor on one of our own monitors.
     let start = start_position(&layout, config.device.id);
-    let controller = crate::input::Controller::new(layout, config.device.id, start);
+    let controller = crate::input::Controller::new(layout, config.device.id, start)
+        .with_input_config(&config.input);
     let capture = deskoryn_input::platform::open_capture()?;
     let injector = deskoryn_input::platform::open_injector()?;
     tracing::info!(backend = ?deskoryn_input::platform::detect(), "input backend");

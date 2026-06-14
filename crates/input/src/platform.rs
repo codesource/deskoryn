@@ -21,12 +21,19 @@ pub enum Backend {
 }
 
 /// Detect the best available backend for the current OS/session.
+///
+/// Reports the backend that [`open_capture`]/[`open_injector`] will actually use,
+/// so the value is meaningful in logs and the status line. Today the only real
+/// Linux backend is evdev/uinput; libei (the sanctioned Wayland portal path) and
+/// X11/XTest are future additions and would be preferred here once implemented:
+///
+/// * libei when an XDG portal + Wayland session is present,
+/// * else X11/XTest when `$DISPLAY` is set,
+/// * else evdev/uinput when `/dev/input` + `/dev/uinput` are accessible.
 pub fn detect() -> Backend {
     #[cfg(all(target_os = "linux", feature = "linux-backend"))]
     {
-        // TODO(impl): prefer libei when XDG portal + Wayland present; else X11
-        // when $DISPLAY set; else evdev/uinput if /dev/input is accessible.
-        return Backend::LinuxLibei;
+        return Backend::LinuxEvdev;
     }
     #[cfg(all(target_os = "windows", feature = "windows-backend"))]
     {

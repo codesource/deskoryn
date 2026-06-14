@@ -160,6 +160,57 @@ impl VirtualDesktop {
     }
 }
 
+/// Layout-editing helpers used by the monitor arranger. These are pure geometry
+/// over the placed rectangles — no I/O — so the arranger CLI and (later) the GUI
+/// share one tested implementation.
+impl VirtualDesktop {
+    /// The first pair of monitors whose bounds overlap, if any. A valid layout
+    /// has none: monitors tile the plane edge-to-edge without overlapping.
+    pub fn first_overlap(&self) -> Option<(MonitorId, MonitorId)> {
+        for (i, a) in self.monitors.iter().enumerate() {
+            for b in &self.monitors[i + 1..] {
+                if rects_overlap(a.bounds, b.bounds) {
+                    return Some((a.id, b.id));
+                }
+            }
+        }
+        None
+    }
+
+    /// Translate every monitor so the desktop's bounding box starts at the
+    /// origin. Keeps saved layouts canonical regardless of how they were built.
+    pub fn normalize(&mut self) {
+        let Some(bb) = self.bounding_box() else { return };
+        if bb.x == 0 && bb.y == 0 {
+            return;
+        }
+        for m in &mut self.monitors {
+            m.bounds.x -= bb.x;
+            m.bounds.y -= bb.y;
+        }
+    }
+
+    /// Compute the bounds for a new `size` monitor placed flush against the
+    /// `side` edge of `anchor`, aligned to the anchor's top-left corner. Returns
+    /// `None` if `anchor` isn't in this desktop.
+    pub fn place_beside(&self, anchor: MonitorId, side: Edge, size: crate::geometry::Size) -> Option<Rect> {
+        let a = self.monitor(anchor)?.bounds;
+        let (w, h) = (size.w, size.h);
+        let (x, y) = match side {
+            Edge::Right => (a.right(), a.top()),
+            Edge::Left => (a.left() - w, a.top()),
+            Edge::Bottom => (a.left(), a.bottom()),
+            Edge::Top => (a.left(), a.top() - h),
+        };
+        Some(Rect::new(x, y, w, h))
+    }
+}
+
+/// Do two rectangles share any interior area? (Touching edges do not overlap.)
+pub fn rects_overlap(a: Rect, b: Rect) -> bool {
+    a.left() < b.right() && b.left() < a.right() && a.top() < b.bottom() && b.top() < a.bottom()
+}
+
 /// Which edge of `bounds` the segment `from -> to` exits through.
 fn exit_edge(bounds: Rect, from: Point, to: Point) -> Edge {
     let dx = to.x - from.x;
@@ -283,6 +334,49 @@ mod tests {
             .expect("should cross into Win-L");
         assert_eq!(t.device, win);
         assert_eq!(t.target.index, 0);
+    }
+
+    #[test]
+    fn detects_overlap() {
+        let d = dev(1);
+        let mut vd = VirtualDesktop::new(vec![
+            mon(d, 0, "A", 0, 0, 1920, 1080),
+            mon(d, 1, "B", 1920, 0, 1920, 1080),
+        ]);
+        assert!(vd.first_overlap().is_none(), "edge-to-edge tiles do not overlap");
+
+        // Nudge B back so it overlaps A.
+        vd.monitors[1].bounds.x = 1900;
+        assert!(vd.first_overlap().is_some());
+    }
+
+    #[test]
+    fn normalize_shifts_bbox_to_origin() {
+        let d = dev(1);
+        let mut vd = VirtualDesktop::new(vec![
+            mon(d, 0, "A", -500, -200, 1920, 1080),
+            mon(d, 1, "B", 1420, -200, 1920, 1080),
+        ]);
+        vd.normalize();
+        let bb = vd.bounding_box().unwrap();
+        assert_eq!((bb.x, bb.y), (0, 0));
+        // Relative placement is preserved.
+        assert_eq!(vd.monitors[0].bounds.x, 0);
+        assert_eq!(vd.monitors[1].bounds.x, 1920);
+    }
+
+    #[test]
+    fn place_beside_each_edge() {
+        let d = dev(1);
+        let vd = VirtualDesktop::new(vec![mon(d, 0, "A", 0, 0, 1920, 1080)]);
+        let anchor = vd.monitors[0].id;
+        let size = Size::new(2560, 1440);
+
+        assert_eq!(vd.place_beside(anchor, Edge::Right, size).unwrap(), Rect::new(1920, 0, 2560, 1440));
+        assert_eq!(vd.place_beside(anchor, Edge::Left, size).unwrap(), Rect::new(-2560, 0, 2560, 1440));
+        assert_eq!(vd.place_beside(anchor, Edge::Bottom, size).unwrap(), Rect::new(0, 1080, 2560, 1440));
+        assert_eq!(vd.place_beside(anchor, Edge::Top, size).unwrap(), Rect::new(0, -1440, 2560, 1440));
+        assert!(vd.place_beside(MonitorId::new(dev(9), 0), Edge::Right, size).is_none());
     }
 
     #[test]
