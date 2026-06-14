@@ -17,7 +17,7 @@ pub enum Backend {
     LinuxLibei,
     LinuxX11,
     LinuxEvdev,
-    WindowsRawInput,
+    WindowsHooks,
 }
 
 /// Detect the best available backend for the current OS/session.
@@ -37,7 +37,7 @@ pub fn detect() -> Backend {
     }
     #[cfg(all(target_os = "windows", feature = "windows-backend"))]
     {
-        return Backend::WindowsRawInput;
+        return Backend::WindowsHooks;
     }
     #[allow(unreachable_code)]
     Backend::Null
@@ -53,6 +53,13 @@ pub fn open_capture() -> Result<Box<dyn Capture>, InputError> {
             Err(e) => tracing::warn!(error = %e, "evdev capture unavailable; using null backend"),
         }
     }
+    #[cfg(all(target_os = "windows", feature = "windows-backend"))]
+    {
+        match windows_backend::HookCapture::open() {
+            Ok(cap) => return Ok(Box::new(cap)),
+            Err(e) => tracing::warn!(error = %e, "hook capture unavailable; using null backend"),
+        }
+    }
     Ok(Box::new(NullCapture::default()))
 }
 
@@ -65,6 +72,11 @@ pub fn open_injector() -> Result<Box<dyn Injector>, InputError> {
             Err(e) => tracing::warn!(error = %e, "uinput injector unavailable; using null backend"),
         }
     }
+    #[cfg(all(target_os = "windows", feature = "windows-backend"))]
+    {
+        return Ok(Box::new(windows_backend::SendInputInjector));
+    }
+    #[allow(unreachable_code)]
     Ok(Box::new(NullInjector))
 }
 
@@ -356,14 +368,379 @@ mod linux {
 }
 
 #[cfg(all(target_os = "windows", feature = "windows-backend"))]
-mod windows {
-    //! Raw Input + `SendInput` backend.
+mod windows_backend {
+    //! Low-level-hook capture + `SendInput` injection.
     //!
-    //! TODO(impl):
-    //! * Capture: register for `WM_INPUT` (Raw Input) for high-resolution
-    //!   relative mouse + keyboard; install `WH_MOUSE_LL` / `WH_KEYBOARD_LL`
-    //!   low-level hooks to *suppress* local delivery while grabbed.
-    //! * Inject: `SendInput` with `MOUSEEVENTF_MOVE` (relative) and scancode
-    //!   keyboard events. Note the secure-desktop / UAC limitation in
-    //!   docs/OS_PROBLEMS.md.
+    //! **Capture** installs `WH_MOUSE_LL` + `WH_KEYBOARD_LL` hooks on a dedicated
+    //! thread running a message loop. The hooks translate every event to the
+    //! evdev wire space and forward it to the async [`Capture`]. While *grabbed*
+    //! they return non-zero to **suppress** local delivery and recenter the
+    //! cursor each motion, so relative deltas keep flowing without the pointer
+    //! piling up against a screen edge. Events flagged injected (our own
+    //! `SendInput`, or another tool's) are ignored, so a machine never re-captures
+    //! what it just injected.
+    //!
+    //! **Injection** uses `SendInput` with relative `MOUSEEVENTF_MOVE`, the button
+    //! / wheel flags, and virtual-key keyboard events (translated from evdev via
+    //! [`crate::keymap`]).
+    //!
+    //! NOTE: like the Linux backend, this is compile-verified (incl. cross-compile)
+    //! but **not** covered by automated tests — it needs a real Windows session.
+    //! See `docs/OS_PROBLEMS.md` for the UAC / secure-desktop limitation (injection
+    //! into elevated windows requires the daemon to be elevated too). Assumes a
+    //! single live [`HookCapture`] at a time (the daemon holds one per session).
+
+    use super::{Capture, InputError, Injector};
+    use crate::keymap;
+    use async_trait::async_trait;
+    use deskoryn_core::geometry::Point;
+    use deskoryn_core::input::{Button, InputEvent, KeyCode, Modifiers, ScrollAxis};
+    use std::mem::size_of;
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE,
+        KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE,
+        MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_XDOWN,
+        MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU,
+        VK_RWIN, VK_SHIFT,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, GetMessageW, GetSystemMetrics, PostThreadMessageW, SetCursorPos, SetWindowsHookExW,
+        UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, MSLLHOOKSTRUCT,
+        SM_CXSCREEN, SM_CYSCREEN, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP,
+    };
+
+    /// Injected low-level mouse events carry this flag in `MSLLHOOKSTRUCT::flags`.
+    const LLMHF_INJECTED: u32 = 0x0000_0001;
+    /// `WHEEL_DELTA`: one wheel notch.
+    const WHEEL_DELTA: i32 = 120;
+    /// X-button identifiers (`mouseData` high word on `WM_XBUTTON*`).
+    const XBUTTON1: u32 = 0x0001;
+    const XBUTTON2: u32 = 0x0002;
+
+    // --- Shared state between the hook thread and the async side ---------------
+    //
+    // The hook procs are plain `extern "system"` functions, so they reach the
+    // active capture through process-global state. We assume one live capture.
+    static EVENTS: Mutex<Option<mpsc::UnboundedSender<InputEvent>>> = Mutex::new(None);
+    static GRABBED: AtomicBool = AtomicBool::new(false);
+    static CENTER_X: AtomicI32 = AtomicI32::new(0);
+    static CENTER_Y: AtomicI32 = AtomicI32::new(0);
+    static LAST_X: AtomicI32 = AtomicI32::new(0);
+    static LAST_Y: AtomicI32 = AtomicI32::new(0);
+
+    fn emit(ev: InputEvent) {
+        if let Ok(guard) = EVENTS.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(ev);
+            }
+        }
+    }
+
+    fn io(e: impl std::fmt::Display) -> InputError {
+        InputError::Backend(e.to_string())
+    }
+
+    // --- Capture ---------------------------------------------------------------
+
+    pub struct HookCapture {
+        rx: mpsc::UnboundedReceiver<InputEvent>,
+        thread_id: u32,
+        join: Option<std::thread::JoinHandle<()>>,
+        mods: Modifiers,
+    }
+
+    impl HookCapture {
+        pub fn open() -> Result<Self, InputError> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            *EVENTS.lock().map_err(|_| io("event slot poisoned"))? = Some(tx);
+            GRABBED.store(false, Ordering::SeqCst);
+
+            let (id_tx, id_rx) = std::sync::mpsc::channel::<Result<u32, String>>();
+            let join = std::thread::Builder::new()
+                .name("deskoryn-input-hooks".into())
+                .spawn(move || hook_thread(id_tx))
+                .map_err(io)?;
+
+            let thread_id = match id_rx.recv() {
+                Ok(Ok(id)) => id,
+                Ok(Err(e)) => return Err(InputError::Backend(e)),
+                Err(_) => return Err(io("hook thread exited before reporting ready")),
+            };
+            Ok(Self { rx, thread_id, join: Some(join), mods: Modifiers::empty() })
+        }
+    }
+
+    impl Drop for HookCapture {
+        fn drop(&mut self) {
+            // Ask the hook thread's message loop to quit, then join it.
+            unsafe {
+                let _ = PostThreadMessageW(self.thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+            if let Ok(mut guard) = EVENTS.lock() {
+                *guard = None;
+            }
+            GRABBED.store(false, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl Capture for HookCapture {
+        async fn set_grabbed(&mut self, grabbed: bool) -> Result<(), InputError> {
+            if grabbed && !GRABBED.load(Ordering::SeqCst) {
+                // Anchor recenter at the middle of the primary screen and warp
+                // there so deltas are measured from a stable point.
+                let (cx, cy) = unsafe { (GetSystemMetrics(SM_CXSCREEN) / 2, GetSystemMetrics(SM_CYSCREEN) / 2) };
+                CENTER_X.store(cx, Ordering::SeqCst);
+                CENTER_Y.store(cy, Ordering::SeqCst);
+                unsafe { SetCursorPos(cx, cy).map_err(io)? };
+            }
+            GRABBED.store(grabbed, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Result<InputEvent, InputError> {
+            let ev = self.rx.recv().await.ok_or_else(|| io("capture stopped"))?;
+            // Track modifier state from forwarded key events for status/UI.
+            if let InputEvent::Key { mods, .. } = ev {
+                self.mods = mods;
+            }
+            Ok(ev)
+        }
+        fn modifiers(&self) -> Modifiers {
+            self.mods
+        }
+    }
+
+    /// Runs on the dedicated hook thread: install hooks, report the thread id,
+    /// pump messages until `WM_QUIT`, then unhook.
+    fn hook_thread(id_tx: std::sync::mpsc::Sender<Result<u32, String>>) {
+        let hmod = match unsafe { GetModuleHandleW(PCWSTR::null()) } {
+            Ok(h) => HINSTANCE(h.0),
+            Err(e) => {
+                let _ = id_tx.send(Err(format!("GetModuleHandleW: {e}")));
+                return;
+            }
+        };
+        let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hmod, 0) };
+        let kbd = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_proc), hmod, 0) };
+        let (mouse, kbd) = match (mouse, kbd) {
+            (Ok(m), Ok(k)) => (m, k),
+            (m, k) => {
+                if let Ok(h) = m {
+                    unsafe { let _ = UnhookWindowsHookEx(h); }
+                }
+                if let Ok(h) = k {
+                    unsafe { let _ = UnhookWindowsHookEx(h); }
+                }
+                let _ = id_tx.send(Err("SetWindowsHookExW failed".into()));
+                return;
+            }
+        };
+        let _ = id_tx.send(Ok(unsafe { GetCurrentThreadId() }));
+
+        // Standard message loop; GetMessageW returns 0 on WM_QUIT.
+        let mut msg = MSG::default();
+        while unsafe { GetMessageW(&mut msg, None, 0, 0) }.0 > 0 {}
+
+        unsafe {
+            let _ = UnhookWindowsHookEx(mouse);
+            let _ = UnhookWindowsHookEx(kbd);
+        }
+    }
+
+    extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code < 0 {
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+        let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        // Never re-capture injected motion/clicks (ours or another tool's).
+        if info.flags & LLMHF_INJECTED != 0 {
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+        let grabbed = GRABBED.load(Ordering::SeqCst);
+        let msg = wparam.0 as u32;
+
+        if msg == WM_MOUSEMOVE {
+            if grabbed {
+                let (cx, cy) = (CENTER_X.load(Ordering::SeqCst), CENTER_Y.load(Ordering::SeqCst));
+                let (dx, dy) = (info.pt.x - cx, info.pt.y - cy);
+                if dx == 0 && dy == 0 {
+                    // The recenter we just issued; swallow without emitting.
+                    return LRESULT(1);
+                }
+                emit(InputEvent::PointerMotion { dx, dy });
+                unsafe { let _ = SetCursorPos(cx, cy); }
+                return LRESULT(1);
+            } else {
+                let (lx, ly) = (LAST_X.swap(info.pt.x, Ordering::SeqCst), LAST_Y.swap(info.pt.y, Ordering::SeqCst));
+                emit(InputEvent::PointerMotion { dx: info.pt.x - lx, dy: info.pt.y - ly });
+                return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+            }
+        }
+
+        if let Some(ev) = mouse_event(msg, info) {
+            emit(ev);
+        }
+        if grabbed {
+            LRESULT(1)
+        } else {
+            unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+        }
+    }
+
+    fn mouse_event(msg: u32, info: &MSLLHOOKSTRUCT) -> Option<InputEvent> {
+        let button = |button, pressed| Some(InputEvent::Button { button, pressed });
+        match msg {
+            WM_LBUTTONDOWN => button(Button::Left, true),
+            WM_LBUTTONUP => button(Button::Left, false),
+            WM_RBUTTONDOWN => button(Button::Right, true),
+            WM_RBUTTONUP => button(Button::Right, false),
+            WM_MBUTTONDOWN => button(Button::Middle, true),
+            WM_MBUTTONUP => button(Button::Middle, false),
+            WM_XBUTTONDOWN | WM_XBUTTONUP => {
+                let xbtn = (info.mouseData >> 16) & 0xFFFF;
+                let b = if xbtn == XBUTTON1 { Button::Back } else { Button::Forward };
+                button(b, msg == WM_XBUTTONDOWN)
+            }
+            WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+                let raw = (info.mouseData >> 16) as i16 as i32;
+                let axis = if msg == WM_MOUSEWHEEL { ScrollAxis::Vertical } else { ScrollAxis::Horizontal };
+                Some(InputEvent::Scroll { axis, delta: raw / WHEEL_DELTA, hi_res: raw })
+            }
+            _ => None,
+        }
+    }
+
+    extern "system" fn kbd_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code < 0 {
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+        let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if info.flags.0 & LLKHF_INJECTED.0 != 0 {
+            return unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) };
+        }
+        let msg = wparam.0 as u32;
+        let pressed = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let released = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+        if pressed || released {
+            if let Some(evcode) = keymap::vk_to_evdev(info.vkCode as u16) {
+                emit(InputEvent::Key { code: KeyCode(evcode), pressed, mods: current_mods() });
+            }
+        }
+        if GRABBED.load(Ordering::SeqCst) {
+            LRESULT(1)
+        } else {
+            unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+        }
+    }
+
+    fn current_mods() -> Modifiers {
+        let down = |vk: VIRTUAL_KEY| (unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000) != 0;
+        let mut m = Modifiers::empty();
+        m.set(Modifiers::SHIFT, down(VK_SHIFT));
+        m.set(Modifiers::CTRL, down(VK_CONTROL));
+        m.set(Modifiers::ALT, down(VK_MENU));
+        m.set(Modifiers::META, down(VK_LWIN) || down(VK_RWIN));
+        m
+    }
+
+    // --- Injection -------------------------------------------------------------
+
+    pub struct SendInputInjector;
+
+    impl SendInputInjector {
+        fn send_mouse(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> Result<(), InputError> {
+            let input = INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+                },
+            };
+            let n = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+            if n == 1 { Ok(()) } else { Err(io("SendInput (mouse) rejected")) }
+        }
+
+        fn send_key(vk: u16, up: bool) -> Result<(), InputError> {
+            let flags = if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) };
+            let input = INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 {
+                    ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), wScan: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 },
+                },
+            };
+            let n = unsafe { SendInput(&[input], size_of::<INPUT>() as i32) };
+            if n == 1 { Ok(()) } else { Err(io("SendInput (key) rejected")) }
+        }
+    }
+
+    #[async_trait]
+    impl Injector for SendInputInjector {
+        async fn warp_to(&mut self, _at: Point) -> Result<(), InputError> {
+            // Like the uinput backend, motion is purely relative; the entry point
+            // is reached by the forwarded deltas, so there is nothing to warp.
+            Ok(())
+        }
+        async fn inject(&mut self, event: InputEvent) -> Result<(), InputError> {
+            match event {
+                InputEvent::PointerMotion { dx, dy } => {
+                    Self::send_mouse(dx, dy, 0, MOUSEEVENTF_MOVE)
+                }
+                InputEvent::Button { button, pressed } => {
+                    let (flags, data) = button_flags(button, pressed);
+                    Self::send_mouse(0, 0, data, flags)
+                }
+                InputEvent::Scroll { axis, delta, hi_res } => {
+                    let amount = if hi_res != 0 { hi_res } else { delta * WHEEL_DELTA };
+                    let flags = match axis {
+                        ScrollAxis::Vertical => MOUSEEVENTF_WHEEL,
+                        ScrollAxis::Horizontal => MOUSEEVENTF_HWHEEL,
+                    };
+                    Self::send_mouse(0, 0, amount as u32, flags)
+                }
+                InputEvent::Key { code, pressed, .. } => match keymap::evdev_to_vk(code.0) {
+                    Some(vk) => Self::send_key(vk, !pressed),
+                    None => Ok(()), // unmapped key: drop rather than mis-inject
+                },
+                // Absolute positioning isn't used in the relative model.
+                InputEvent::PointerPosition { .. } => Ok(()),
+            }
+        }
+        async fn release_all(&mut self) -> Result<(), InputError> {
+            // Release the mouse buttons we might be holding; held keyboard keys
+            // can't be enumerated, so the receiver's key-repeat settles them.
+            for (b, _) in [
+                (Button::Left, ()),
+                (Button::Right, ()),
+                (Button::Middle, ()),
+            ] {
+                let (flags, data) = button_flags(b, false);
+                Self::send_mouse(0, 0, data, flags)?;
+            }
+            Ok(())
+        }
+    }
+
+    fn button_flags(button: Button, pressed: bool) -> (MOUSE_EVENT_FLAGS, u32) {
+        match button {
+            Button::Left => (if pressed { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }, 0),
+            Button::Right => (if pressed { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP }, 0),
+            Button::Middle => (if pressed { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }, 0),
+            Button::Back => (if pressed { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, XBUTTON1),
+            Button::Forward => (if pressed { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, XBUTTON2),
+            Button::Other(_) => (if pressed { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }, 0),
+        }
+    }
 }

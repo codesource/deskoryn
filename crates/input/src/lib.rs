@@ -21,6 +21,7 @@
 //! security model, uinput permissions, UAC/secure-desktop, etc.).
 
 pub mod hotkey;
+pub mod keymap;
 pub mod platform;
 
 use async_trait::async_trait;

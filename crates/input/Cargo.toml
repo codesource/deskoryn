@@ -11,7 +11,7 @@ default = []
 # Enable real OS backends. Off by default so the trait surface + a no-op backend
 # compile everywhere (CI, the other platform, dry-run).
 linux-backend = ["dep:evdev"]
-windows-backend = []
+windows-backend = ["dep:windows"]
 
 [dependencies]
 deskoryn-core.workspace = true
@@ -25,7 +25,14 @@ tokio.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = { version = "0.12", optional = true, features = ["tokio"] }
 
-# Windows backend (Raw Input + SendInput) would be wired here, gated by
-# `windows-backend`; it cannot be compiled on a Linux host without the target:
-# [target.'cfg(target_os = "windows")'.dependencies]
-# windows = { version = "0.58", features = ["Win32_UI_Input_KeyboardAndMouse"], optional = true }
+# Windows backend: low-level hooks (capture + suppression) + SendInput (inject).
+# Optional + target-gated so a Linux host never pulls it in; enable with the
+# `windows-backend` feature when building/cross-compiling for Windows.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
