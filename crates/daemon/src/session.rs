@@ -62,9 +62,30 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
     let control = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default());
     let input = crate::input::run_input(session.as_ref(), controller, capture, injector);
 
+    // Clipboard sync (text today). Bridge the local OS clipboard to the peer over
+    // the Clipboard channel; skipped entirely when disabled in config. When the
+    // portable/no-op backend is selected the pump simply parks (idle stream).
+    type PumpFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
+    let clipboard: PumpFuture = if config.clipboard.sync_text {
+        let (clip_sink, clip_source) = session.channel(Channel::Clipboard).await?;
+        let (clip_access, clip_changes) = deskoryn_clipboard::platform::open_access(
+            std::time::Duration::from_millis(config.clipboard.poll_ms),
+        );
+        Box::pin(crate::clipboard::run_clipboard(
+            clip_access,
+            clip_changes,
+            clip_sink,
+            clip_source,
+            config.clipboard.inline_max_bytes,
+        ))
+    } else {
+        Box::pin(std::future::pending())
+    };
+
     let end = tokio::select! {
         r = control => { r.map(|e| format!("{e:?}")) }
         r = input => { r.map(|_| "input pump ended".to_string()) }
+        r = clipboard => { r.map(|_| "clipboard pump ended".to_string()) }
     }?;
     tracing::info!(%peer, %end, "session ended");
     Ok(())

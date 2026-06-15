@@ -5,9 +5,8 @@
 //! pulled on demand (delayed rendering). Receiving a write doesn't re-notify the
 //! local watcher, so there is no A→B→A echo. See `docs/PROTOCOL.md`.
 
-// Wired to live OS clipboards in the M3 backends; exercised today by the
-// integration test and runnable over any session.
-#![allow(dead_code)]
+// Wired into the per-peer session (`crate::session`) over the Clipboard channel;
+// the real OS backend is selected by `deskoryn_clipboard::platform::open_access`.
 
 use bytes::BytesMut;
 use deskoryn_clipboard::{ClipboardAccess, LocalClip};

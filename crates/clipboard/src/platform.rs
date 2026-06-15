@@ -135,6 +135,42 @@ pub fn open() -> Result<Box<dyn ClipboardMonitor>, ClipboardError> {
     Ok(Box::new(MemoryClipboard::new()))
 }
 
+/// A no-op [`ClipboardAccess`] for the portable build / `--dry-run`: it never
+/// observes or renders anything. It holds the change-stream sender so the pump's
+/// change stream parks forever instead of seeing EOF and tearing the session down.
+pub struct IdleClipboard {
+    _keep_change_tx: mpsc::UnboundedSender<LocalClip>,
+}
+
+impl ClipboardAccess for IdleClipboard {
+    fn read(&self, _format: ClipFormat) -> Option<ClipPayload> {
+        None
+    }
+    fn write(&self, _payload: ClipPayload) {}
+}
+
+/// The pump-facing entry point: a [`ClipboardAccess`] over the local clipboard
+/// plus the change stream the pump watches.
+///
+/// With a backend feature enabled this is the real OS clipboard (polled every
+/// `poll`, text today; echo-suppressed). Otherwise it is an idle no-op backend
+/// so the default/portable build and `--dry-run` still wire the pump without
+/// touching any real clipboard.
+pub fn open_access(
+    poll: std::time::Duration,
+) -> (Arc<dyn ClipboardAccess>, mpsc::UnboundedReceiver<LocalClip>) {
+    #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+    {
+        match system::watch(poll) {
+            Ok((access, rx)) => return (access as Arc<dyn ClipboardAccess>, rx),
+            Err(e) => tracing::warn!(error = %e, "system clipboard unavailable; using idle backend"),
+        }
+    }
+    let _ = poll;
+    let (tx, rx) = mpsc::unbounded_channel();
+    (Arc::new(IdleClipboard { _keep_change_tx: tx }), rx)
+}
+
 /// Real OS clipboard via `arboard`, behind the `*-backend` features.
 ///
 /// Compile-verified; runtime needs a desktop session (X11/Wayland display or the
@@ -143,16 +179,27 @@ pub fn open() -> Result<Box<dyn ClipboardMonitor>, ClipboardError> {
 pub mod system {
     use super::*;
 
-    /// [`ClipboardAccess`] over the OS clipboard. Echo-suppressed: the content we
-    /// `write` is remembered so the poller (see [`watch`]) doesn't re-offer it.
+    /// [`ClipboardAccess`] over the OS clipboard, backed by **one** long-lived
+    /// `arboard::Clipboard`.
+    ///
+    /// A persistent handle matters on X11: the selection's owner *is* the
+    /// `Clipboard` instance, so a fresh-per-call handle drops ownership the
+    /// instant it returns and the content only survives if a clipboard manager
+    /// happens to grab it (arboard warns about exactly this). Holding one handle
+    /// for the backend's lifetime keeps written content available, and also
+    /// avoids opening a new X11 connection on every poll.
+    ///
+    /// Echo-suppressed: the content we `write` is remembered so the poller (see
+    /// [`watch`]) doesn't re-offer it back to the peer.
     pub struct SystemClipboard {
+        cb: Arc<StdMutex<arboard::Clipboard>>,
         last_written: Arc<StdMutex<Option<String>>>,
     }
 
     impl ClipboardAccess for SystemClipboard {
         fn read(&self, format: ClipFormat) -> Option<ClipPayload> {
             match format {
-                ClipFormat::Utf8Text => arboard::Clipboard::new().ok()?.get_text().ok().map(ClipPayload::Text),
+                ClipFormat::Utf8Text => self.cb.lock().unwrap().get_text().ok().map(ClipPayload::Text),
                 // TODO(impl): images via arboard get_image() (RGBA <-> PNG with the
                 // `image` crate); file lists via the OS file-clipboard formats.
                 _ => None,
@@ -161,10 +208,11 @@ pub mod system {
 
         fn write(&self, payload: ClipPayload) {
             if let ClipPayload::Text(text) = payload {
-                if let Ok(mut cb) = arboard::Clipboard::new() {
-                    if cb.set_text(text.clone()).is_ok() {
-                        *self.last_written.lock().unwrap() = Some(text);
-                    }
+                // Remember the text *before* setting it so the poller can't race
+                // in and re-offer our own write as a fresh local change.
+                *self.last_written.lock().unwrap() = Some(text.clone());
+                if self.cb.lock().unwrap().set_text(text).is_err() {
+                    *self.last_written.lock().unwrap() = None;
                 }
             }
         }
@@ -172,10 +220,15 @@ pub mod system {
 
     /// Build the system clipboard access plus a change stream produced by polling
     /// (arboard exposes no change events). Polling skips content we wrote
-    /// ourselves so there is no echo.
-    pub fn watch(poll: std::time::Duration) -> (Arc<SystemClipboard>, mpsc::UnboundedReceiver<LocalClip>) {
+    /// ourselves so there is no echo. Fails if no OS clipboard is reachable
+    /// (e.g. no display).
+    pub fn watch(
+        poll: std::time::Duration,
+    ) -> Result<(Arc<SystemClipboard>, mpsc::UnboundedReceiver<LocalClip>), ClipboardError> {
+        let cb = arboard::Clipboard::new().map_err(|e| ClipboardError::Backend(e.to_string()))?;
+        let cb = Arc::new(StdMutex::new(cb));
         let last_written = Arc::new(StdMutex::new(None::<String>));
-        let access = Arc::new(SystemClipboard { last_written: last_written.clone() });
+        let access = Arc::new(SystemClipboard { cb: cb.clone(), last_written: last_written.clone() });
         let (tx, rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
@@ -183,8 +236,10 @@ pub mod system {
             let mut seq: u64 = 0;
             loop {
                 tokio::time::sleep(poll).await;
-                let Ok(mut cb) = arboard::Clipboard::new() else { continue };
-                let Ok(text) = cb.get_text() else { continue };
+                let text = match cb.lock().unwrap().get_text() {
+                    Ok(t) => t,
+                    Err(_) => continue, // empty or non-text clipboard
+                };
                 if last_seen.as_deref() == Some(text.as_str()) {
                     continue; // unchanged
                 }
@@ -200,6 +255,6 @@ pub mod system {
             }
         });
 
-        (access, rx)
+        Ok((access, rx))
     }
 }

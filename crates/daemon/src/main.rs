@@ -92,6 +92,15 @@ enum Cmd {
         #[arg(long)]
         inject: bool,
     },
+    /// Exercise the local clipboard backend in isolation (watch + optional set).
+    ClipTest {
+        /// Seconds to watch the clipboard for changes.
+        #[arg(long, default_value_t = 10)]
+        secs: u64,
+        /// Write this text to the clipboard first, then watch.
+        #[arg(long)]
+        set: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -125,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status => status_command(&paths).await,
         Cmd::Arrange { cmd } => arrange::run(config, &config_path, cmd),
         Cmd::InputTest { secs, inject } => diag::input_test(secs, inject).await,
+        Cmd::ClipTest { secs, set } => diag::clip_test(config, secs, set).await,
         Cmd::Devices => {
             let store = deskoryn_core::trust::TrustStore::load(&paths.trust_file())?;
             for d in &store.devices {

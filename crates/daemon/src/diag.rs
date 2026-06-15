@@ -86,3 +86,59 @@ pub async fn input_test(secs: u64, inject: bool) -> anyhow::Result<()> {
     println!("captured {count} events.");
     Ok(())
 }
+
+/// `deskorynd clip-test` — a standalone clipboard-backend diagnostic.
+///
+/// Mirrors [`input_test`] for M3: it exercises the real OS clipboard
+/// (`open_access`) in isolation — no peer, no network — so each machine can be
+/// validated before a live session. With `--set` it writes text first; then it
+/// watches for changes for a few seconds (copy something to see it land).
+///
+/// With the default (portable) build the backend is the idle no-op and this just
+/// explains how to get a real one (`--features linux` / `--features windows`).
+pub async fn clip_test(
+    config: std::sync::Arc<deskoryn_core::config::AppConfig>,
+    secs: u64,
+    set: Option<String>,
+) -> anyhow::Result<()> {
+    use deskoryn_proto::{ClipFormat, ClipPayload};
+
+    let real_backend = cfg!(any(feature = "linux", feature = "windows"));
+    if !real_backend {
+        println!(
+            "clipboard backend: idle no-op (portable build) — it never reads or writes.\n\
+             rebuild with the OS backend to test the real clipboard, e.g.:\n  \
+             cargo run -p deskoryn-daemon --features linux -- clip-test"
+        );
+        return Ok(());
+    }
+    println!("clipboard backend: real OS clipboard (arboard, text), polling every {} ms", config.clipboard.poll_ms);
+
+    let poll = Duration::from_millis(config.clipboard.poll_ms);
+    let (access, mut changes) = deskoryn_clipboard::platform::open_access(poll);
+
+    if let Some(text) = set {
+        println!("setting clipboard to: {text:?}");
+        access.write(ClipPayload::Text(text));
+    } else if let Some(ClipPayload::Text(cur)) = access.read(ClipFormat::Utf8Text) {
+        println!("current clipboard text: {cur:?}");
+    }
+
+    println!("watching for changes for {secs}s (copy some text to see it detected)...");
+    let deadline = tokio::time::sleep(Duration::from_secs(secs));
+    tokio::pin!(deadline);
+    let mut count = 0u64;
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            change = changes.recv() => {
+                let Some(change) = change else { break };
+                count += 1;
+                let text = access.read(ClipFormat::Utf8Text);
+                println!("  change seq={} formats={:?} text={:?}", change.seq, change.formats, text);
+            }
+        }
+    }
+    println!("observed {count} clipboard change(s).");
+    Ok(())
+}

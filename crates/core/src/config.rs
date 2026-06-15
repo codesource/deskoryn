@@ -137,6 +137,15 @@ pub struct ClipboardConfig {
     /// Inline payloads up to this size on the control stream; larger payloads
     /// are pulled on demand over a dedicated stream.
     pub inline_max_bytes: u64,
+    /// How often the OS clipboard is polled for changes, in milliseconds. The
+    /// cross-platform `arboard` backend exposes no change events, so the backend
+    /// polls; lower = snappier paste, higher = less idle wakeups.
+    #[serde(default = "default_poll_ms")]
+    pub poll_ms: u64,
+}
+
+fn default_poll_ms() -> u64 {
+    250
 }
 
 impl Default for ClipboardConfig {
@@ -146,6 +155,7 @@ impl Default for ClipboardConfig {
             sync_images: true,
             sync_files: true,
             inline_max_bytes: 256 * 1024,
+            poll_ms: 250,
         }
     }
 }
