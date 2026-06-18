@@ -153,7 +153,7 @@ impl ClipboardAccess for IdleClipboard {
 /// plus the change stream the pump watches.
 ///
 /// With a backend feature enabled this is the real OS clipboard (polled every
-/// `poll`, text today; echo-suppressed). Otherwise it is an idle no-op backend
+/// `poll`, text + images; echo-suppressed). Otherwise it is an idle no-op backend
 /// so the default/portable build and `--dry-run` still wire the pump without
 /// touching any real clipboard.
 pub fn open_access(
@@ -174,10 +174,74 @@ pub fn open_access(
 /// Real OS clipboard via `arboard`, behind the `*-backend` features.
 ///
 /// Compile-verified; runtime needs a desktop session (X11/Wayland display or the
-/// Windows clipboard). Text is fully supported; image/file formats are a TODO.
+/// Windows clipboard). Text and images (PNG on the wire) are supported; file
+/// lists still need OS-native formats (`CF_HDROP` / `text/uri-list`), which
+/// arboard does not expose.
 #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
 pub mod system {
     use super::*;
+    use std::hash::{Hash, Hasher};
+
+    /// Content hash of an offerable clipboard item, computed over the *canonical
+    /// clipboard representation* (the text string, or the decoded RGBA pixels) —
+    /// not the wire payload. PNG re-encoding is not byte-stable, so hashing the
+    /// PNG bytes would defeat image echo-suppression; hashing the RGBA the
+    /// clipboard actually holds round-trips exactly.
+    fn text_hash(s: &str) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        0u8.hash(&mut h);
+        s.hash(&mut h);
+        h.finish()
+    }
+
+    fn image_hash(width: usize, height: usize, rgba: &[u8]) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        1u8.hash(&mut h);
+        width.hash(&mut h);
+        height.hash(&mut h);
+        rgba.hash(&mut h);
+        h.finish()
+    }
+
+    /// Encode arboard's RGBA8 image to PNG bytes for the wire.
+    fn encode_png(img: &arboard::ImageData) -> Option<Vec<u8>> {
+        use image::codecs::png::PngEncoder;
+        use image::{ExtendedColorType, ImageEncoder};
+        let mut out = Vec::new();
+        PngEncoder::new(&mut out)
+            .write_image(&img.bytes, img.width as u32, img.height as u32, ExtendedColorType::Rgba8)
+            .ok()?;
+        Some(out)
+    }
+
+    /// Decode wire PNG bytes back to arboard's RGBA8 image.
+    fn decode_png(bytes: &[u8]) -> Option<arboard::ImageData<'static>> {
+        let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        Some(arboard::ImageData {
+            width: w as usize,
+            height: h as usize,
+            bytes: std::borrow::Cow::Owned(rgba.into_raw()),
+        })
+    }
+
+    /// What the OS clipboard currently offers, as `(format, content hash)`. Text
+    /// wins over an image when both are present (the common case after copying
+    /// text). The hash drives change detection in [`watch`] without rendering or
+    /// encoding anything — the bytes are produced lazily in [`SystemClipboard::read`].
+    fn probe(cb: &StdMutex<arboard::Clipboard>) -> Option<(ClipFormat, u64)> {
+        let mut g = cb.lock().unwrap();
+        if let Ok(t) = g.get_text() {
+            if !t.is_empty() {
+                return Some((ClipFormat::Utf8Text, text_hash(&t)));
+            }
+        }
+        if let Ok(img) = g.get_image() {
+            return Some((ClipFormat::Png, image_hash(img.width, img.height, &img.bytes)));
+        }
+        None
+    }
 
     /// [`ClipboardAccess`] over the OS clipboard, backed by **one** long-lived
     /// `arboard::Clipboard`.
@@ -189,31 +253,46 @@ pub mod system {
     /// for the backend's lifetime keeps written content available, and also
     /// avoids opening a new X11 connection on every poll.
     ///
-    /// Echo-suppressed: the content we `write` is remembered so the poller (see
-    /// [`watch`]) doesn't re-offer it back to the peer.
+    /// Echo-suppressed: the content we `write` is remembered (as a content hash)
+    /// so the poller (see [`watch`]) doesn't re-offer it back to the peer.
     pub struct SystemClipboard {
         cb: Arc<StdMutex<arboard::Clipboard>>,
-        last_written: Arc<StdMutex<Option<String>>>,
+        last_written: Arc<StdMutex<Option<u64>>>,
     }
 
     impl ClipboardAccess for SystemClipboard {
         fn read(&self, format: ClipFormat) -> Option<ClipPayload> {
+            let mut g = self.cb.lock().unwrap();
             match format {
-                ClipFormat::Utf8Text => self.cb.lock().unwrap().get_text().ok().map(ClipPayload::Text),
-                // TODO(impl): images via arboard get_image() (RGBA <-> PNG with the
-                // `image` crate); file lists via the OS file-clipboard formats.
+                ClipFormat::Utf8Text => g.get_text().ok().map(ClipPayload::Text),
+                ClipFormat::Png => {
+                    let img = g.get_image().ok()?;
+                    encode_png(&img).map(ClipPayload::Bytes)
+                }
+                // File lists need OS-native formats arboard can't reach.
                 _ => None,
             }
         }
 
         fn write(&self, payload: ClipPayload) {
-            if let ClipPayload::Text(text) = payload {
-                // Remember the text *before* setting it so the poller can't race
-                // in and re-offer our own write as a fresh local change.
-                *self.last_written.lock().unwrap() = Some(text.clone());
-                if self.cb.lock().unwrap().set_text(text).is_err() {
-                    *self.last_written.lock().unwrap() = None;
+            // Remember the content hash *before* setting it so the poller can't
+            // race in and re-offer our own write as a fresh local change.
+            match payload {
+                ClipPayload::Text(text) => {
+                    *self.last_written.lock().unwrap() = Some(text_hash(&text));
+                    if self.cb.lock().unwrap().set_text(text).is_err() {
+                        *self.last_written.lock().unwrap() = None;
+                    }
                 }
+                ClipPayload::Bytes(png) => {
+                    let Some(img) = decode_png(&png) else { return };
+                    *self.last_written.lock().unwrap() =
+                        Some(image_hash(img.width, img.height, &img.bytes));
+                    if self.cb.lock().unwrap().set_image(img).is_err() {
+                        *self.last_written.lock().unwrap() = None;
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -227,34 +306,77 @@ pub mod system {
     ) -> Result<(Arc<SystemClipboard>, mpsc::UnboundedReceiver<LocalClip>), ClipboardError> {
         let cb = arboard::Clipboard::new().map_err(|e| ClipboardError::Backend(e.to_string()))?;
         let cb = Arc::new(StdMutex::new(cb));
-        let last_written = Arc::new(StdMutex::new(None::<String>));
+        let last_written = Arc::new(StdMutex::new(None::<u64>));
         let access = Arc::new(SystemClipboard { cb: cb.clone(), last_written: last_written.clone() });
         let (tx, rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {
-            let mut last_seen: Option<String> = None;
+            let mut last_seen: Option<u64> = None;
             let mut seq: u64 = 0;
             loop {
                 tokio::time::sleep(poll).await;
-                let text = match cb.lock().unwrap().get_text() {
-                    Ok(t) => t,
-                    Err(_) => continue, // empty or non-text clipboard
-                };
-                if last_seen.as_deref() == Some(text.as_str()) {
+                let Some((fmt, hash)) = probe(&cb) else { continue };
+                if last_seen == Some(hash) {
                     continue; // unchanged
                 }
-                last_seen = Some(text.clone());
+                last_seen = Some(hash);
                 // Suppress our own writes (echo).
-                if last_written.lock().unwrap().as_deref() == Some(text.as_str()) {
+                if *last_written.lock().unwrap() == Some(hash) {
                     continue;
                 }
                 seq += 1;
-                if tx.send(LocalClip { seq, formats: vec![ClipFormat::Utf8Text] }).is_err() {
+                if tx.send(LocalClip { seq, formats: vec![fmt] }).is_err() {
                     break;
                 }
             }
         });
 
         Ok((access, rx))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn sample(width: usize, height: usize) -> arboard::ImageData<'static> {
+            // A deterministic RGBA gradient so the PNG has real, varied content.
+            let mut bytes = Vec::with_capacity(width * height * 4);
+            for y in 0..height {
+                for x in 0..width {
+                    bytes.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 0xff]);
+                }
+            }
+            arboard::ImageData { width, height, bytes: std::borrow::Cow::Owned(bytes) }
+        }
+
+        #[test]
+        fn png_round_trips_pixels() {
+            let img = sample(7, 5);
+            let png = encode_png(&img).expect("encode");
+            let back = decode_png(&png).expect("decode");
+            assert_eq!((back.width, back.height), (7, 5));
+            assert_eq!(back.bytes.as_ref(), img.bytes.as_ref(), "RGBA must survive PNG round-trip");
+        }
+
+        #[test]
+        fn image_hash_survives_png_reencode() {
+            // The echo-suppression invariant: a write() stores the hash of the
+            // RGBA it set; the poller later reads that RGBA back and must compute
+            // the *same* hash so it doesn't re-offer our own write. PNG bytes are
+            // not byte-stable across encode, so the hash is over RGBA, not PNG.
+            let img = sample(16, 16);
+            let written = image_hash(img.width, img.height, &img.bytes);
+
+            let png = encode_png(&img).expect("encode");
+            let reread = decode_png(&png).expect("decode");
+            let seen = image_hash(reread.width, reread.height, &reread.bytes);
+
+            assert_eq!(written, seen, "image echo hash must be stable across PNG round-trip");
+        }
+
+        #[test]
+        fn decode_rejects_garbage() {
+            assert!(decode_png(b"not a png").is_none());
+        }
     }
 }

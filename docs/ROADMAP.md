@@ -86,14 +86,28 @@ tuning/polish and the optional alt backends, not blockers.
 > OS-native backend (real clipboard / filesystem triggers / audio devices),
 > which needs a graphical session and hardware to validate.
 
-## M3 — Global clipboard
+## M3 — Global clipboard 🚧 (text live across Linux↔Windows)
 
 - ✅ Clipboard sync pump (`daemon::clipboard`): inline small text, delayed
   rendering (`Pull`) for other formats, echo suppression. Tested both directions.
-- ⬜ OS backends — Linux: `wlr-data-control`/portal + X11 selections (`INCR`);
-  Windows: Clipboard API + `WM_RENDERFORMAT`; image + file-list formats.
+- ✅ OS text backend via `arboard` (behind `linux`/`windows` features): one
+  long-lived handle (X11 selection ownership), poll-based change detection,
+  echo suppression. `deskorynd clip-test` diagnostic for per-machine bring-up.
+  **Hardware-validated:** copy text on one machine, paste on the other, both
+  directions, live in a real Linux↔Windows session.
+- ✅ OS image backend (behind `linux`/`windows`): arboard `get_image`/`set_image`
+  with RGBA ⇄ PNG (`image` crate); rides the existing `Pull`→`Data` delayed-
+  rendering path (images exceed the 256 KB inline threshold, fit the 16 MB
+  frame). Content-hash change detection + echo suppression over RGBA (PNG
+  re-encode is not byte-stable). Round-trip + echo-hash invariant unit-tested.
+  *Code-complete; pending HW validation.*
+- ⬜ Remaining formats — file-list (X11/Wayland `text/uri-list` ⇄ Windows
+  `CF_HDROP`, bytes via the file-transfer machinery); arboard can't reach these,
+  so they need OS-native code. Native change events to replace polling; Wayland
+  `wlr-data-control`/portal + X11 `INCR` for very large (>16 MB) transfers.
 
 **Exit:** copy text/image on one machine, paste on the other, both directions.
+**Text path reached.**
 
 ---
 

@@ -9,9 +9,10 @@ license.workspace = true
 [features]
 default = []
 # A real OS clipboard via `arboard` (cross-platform: X11/Wayland, Windows,
-# macOS). Both per-OS feature names map to it.
-linux-backend = ["dep:arboard"]
-windows-backend = ["dep:arboard"]
+# macOS). Both per-OS feature names map to it. `image` handles RGBA<->PNG for
+# the image format.
+linux-backend = ["dep:arboard", "dep:image"]
+windows-backend = ["dep:arboard", "dep:image"]
 
 [dependencies]
 deskoryn-core.workspace = true
@@ -21,3 +22,4 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 arboard = { version = "3", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
