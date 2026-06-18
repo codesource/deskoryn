@@ -15,6 +15,9 @@ use deskoryn_proto::{Channel, Control, PROTOCOL_VERSION};
 use std::sync::Arc;
 
 pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::Result<()> {
+    // Shared so the clipboard pump can open the FileXfer channel for file-paste
+    // while the input pump keeps using the same session.
+    let session: Arc<dyn Session> = Arc::from(session);
     let peer = session.peer();
     tracing::info!(%peer, "session established");
 
@@ -62,21 +65,33 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
     let control = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default());
     let input = crate::input::run_input(session.as_ref(), controller, capture, injector);
 
-    // Clipboard sync (text today). Bridge the local OS clipboard to the peer over
-    // the Clipboard channel; skipped entirely when disabled in config. When the
-    // portable/no-op backend is selected the pump simply parks (idle stream).
+    // Clipboard sync (text + images; files via the FileXfer channel). Bridge the
+    // local OS clipboard to the peer over the Clipboard channel; skipped entirely
+    // when all clipboard sync is disabled. When the portable/no-op backend is
+    // selected the pump simply parks (idle stream).
+    let clip = &config.clipboard;
     type PumpFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
-    let clipboard: PumpFuture = if config.clipboard.sync_text {
+    let clipboard: PumpFuture = if clip.sync_text || clip.sync_images || clip.sync_files {
         let (clip_sink, clip_source) = session.channel(Channel::Clipboard).await?;
         let (clip_access, clip_changes) = deskoryn_clipboard::platform::open_access(
-            std::time::Duration::from_millis(config.clipboard.poll_ms),
+            std::time::Duration::from_millis(clip.poll_ms),
         );
+        let files = clip.sync_files.then(|| crate::clipboard::FileSync {
+            download_dir: config
+                .file_transfer
+                .download_dir
+                .clone()
+                .unwrap_or_else(|| std::env::temp_dir().join("deskoryn-received")),
+            policy: config.file_transfer.conflict_policy,
+        });
         Box::pin(crate::clipboard::run_clipboard(
             clip_access,
             clip_changes,
             clip_sink,
             clip_source,
-            config.clipboard.inline_max_bytes,
+            clip.inline_max_bytes,
+            session.clone(),
+            files,
         ))
     } else {
         Box::pin(std::future::pending())

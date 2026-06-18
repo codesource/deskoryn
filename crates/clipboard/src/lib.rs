@@ -51,6 +51,20 @@ pub struct LocalClip {
 pub trait ClipboardAccess: Send + Sync {
     fn read(&self, format: ClipFormat) -> Option<ClipPayload>;
     fn write(&self, payload: ClipPayload);
+
+    /// Absolute paths of files/folders currently on the local file clipboard, if
+    /// any. Unlike [`read`](Self::read), which returns wire metadata, this yields
+    /// the *source* paths so the pump can stream their bytes over the file-
+    /// transfer channel. Returns `None` when there is no file list (or the
+    /// backend can't read one — arboard can't, so OS-native backends fill this in).
+    fn read_files(&self) -> Option<Vec<std::path::PathBuf>> {
+        None
+    }
+
+    /// Place a file list on the local clipboard, pointing at `paths` (where the
+    /// fetched files landed) so a subsequent OS paste resolves to real files.
+    /// No-op on backends that can't write a file list.
+    fn write_files(&self, _paths: &[std::path::PathBuf]) {}
 }
 
 /// Observe and read/write the local OS clipboard.

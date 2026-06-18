@@ -9,18 +9,31 @@
 use crate::{ClipboardAccess, ClipboardError, ClipboardMonitor, LocalClip};
 use async_trait::async_trait;
 use deskoryn_proto::{ClipFormat, ClipPayload};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
+/// Shared in-memory clipboard state behind both [`MemClipboard`] and its
+/// [`ClipInjector`].
+#[derive(Default)]
+struct MemState {
+    /// Current text/image/html content (what `read`/`write` see).
+    content: Option<ClipPayload>,
+    /// Absolute source paths of a simulated file copy (what `read_files` sees).
+    files: Option<Vec<PathBuf>>,
+    /// Paths handed to `write_files` — i.e. where a received file-paste landed.
+    landed: Option<Vec<PathBuf>>,
+}
+
 /// In-memory [`ClipboardAccess`] backing the pump in tests and `--dry-run`.
 pub struct MemClipboard {
-    shared: Arc<StdMutex<Option<ClipPayload>>>,
+    shared: Arc<StdMutex<MemState>>,
 }
 
 impl ClipboardAccess for MemClipboard {
     fn read(&self, format: ClipFormat) -> Option<ClipPayload> {
-        let cur = self.shared.lock().unwrap().clone()?;
+        let cur = self.shared.lock().unwrap().content.clone()?;
         let matches = matches!(
             (format, &cur),
             (ClipFormat::Utf8Text, ClipPayload::Text(_))
@@ -32,14 +45,22 @@ impl ClipboardAccess for MemClipboard {
     }
 
     fn write(&self, payload: ClipPayload) {
-        *self.shared.lock().unwrap() = Some(payload);
+        self.shared.lock().unwrap().content = Some(payload);
+    }
+
+    fn read_files(&self) -> Option<Vec<PathBuf>> {
+        self.shared.lock().unwrap().files.clone()
+    }
+
+    fn write_files(&self, paths: &[PathBuf]) {
+        self.shared.lock().unwrap().landed = Some(paths.to_vec());
     }
 }
 
 /// Simulates local copies (and inspects the current content) for the in-memory
 /// clipboard, sharing state with the [`MemClipboard`] from the same [`memory`] call.
 pub struct ClipInjector {
-    shared: Arc<StdMutex<Option<ClipPayload>>>,
+    shared: Arc<StdMutex<MemState>>,
     tx: mpsc::UnboundedSender<LocalClip>,
     seq: AtomicU64,
 }
@@ -47,7 +68,7 @@ pub struct ClipInjector {
 impl ClipInjector {
     /// Simulate a local "copy text", notifying any watcher.
     pub fn copy_text(&self, text: impl Into<String>) {
-        *self.shared.lock().unwrap() = Some(ClipPayload::Text(text.into()));
+        self.shared.lock().unwrap().content = Some(ClipPayload::Text(text.into()));
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let _ = self.tx.send(LocalClip {
             seq,
@@ -55,16 +76,31 @@ impl ClipInjector {
         });
     }
 
+    /// Simulate a local "copy files", notifying any watcher with a `FileList`.
+    pub fn copy_files(&self, paths: Vec<PathBuf>) {
+        self.shared.lock().unwrap().files = Some(paths);
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(LocalClip {
+            seq,
+            formats: vec![ClipFormat::FileList],
+        });
+    }
+
     /// The content currently on this (in-memory) clipboard.
     pub fn current(&self) -> Option<ClipPayload> {
-        self.shared.lock().unwrap().clone()
+        self.shared.lock().unwrap().content.clone()
+    }
+
+    /// Where a received file-paste landed (what `write_files` recorded), if any.
+    pub fn landed_files(&self) -> Option<Vec<PathBuf>> {
+        self.shared.lock().unwrap().landed.clone()
     }
 }
 
 /// Build an in-memory clipboard: a shared [`ClipboardAccess`], an injector to
 /// drive/inspect it, and the change stream the pump watches.
 pub fn memory() -> (Arc<MemClipboard>, ClipInjector, mpsc::UnboundedReceiver<LocalClip>) {
-    let shared = Arc::new(StdMutex::new(None));
+    let shared = Arc::new(StdMutex::new(MemState::default()));
     let (tx, rx) = mpsc::unbounded_channel();
     let access = Arc::new(MemClipboard { shared: shared.clone() });
     let injector = ClipInjector {
@@ -273,6 +309,12 @@ pub mod system {
                 _ => None,
             }
         }
+
+        // TODO(impl): file-list read/write are the remaining OS-native gap —
+        // Windows `CF_HDROP`, X11/Wayland `text/uri-list`. arboard can't reach
+        // them, so `read_files`/`write_files` keep the trait's no-op defaults
+        // until those backends land; the daemon's file-paste handoff is wired
+        // and loopback-tested behind them.
 
         fn write(&self, payload: ClipPayload) {
             // Remember the content hash *before* setting it so the poller can't

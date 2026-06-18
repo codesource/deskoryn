@@ -391,6 +391,7 @@ dependencies = [
  "async-trait",
  "deskoryn-core",
  "deskoryn-proto",
+ "image",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -101,13 +101,23 @@ tuning/polish and the optional alt backends, not blockers.
   frame). Content-hash change detection + echo suppression over RGBA (PNG
   re-encode is not byte-stable). Round-trip + echo-hash invariant unit-tested.
   *Code-complete; pending HW validation.*
-- ⬜ Remaining formats — file-list (X11/Wayland `text/uri-list` ⇄ Windows
-  `CF_HDROP`, bytes via the file-transfer machinery); arboard can't reach these,
-  so they need OS-native code. Native change events to replace polling; Wayland
-  `wlr-data-control`/portal + X11 `INCR` for very large (>16 MB) transfers.
+- ✅ File-clipboard handoff (`daemon::clipboard` ↔ `daemon::transfer`): copying
+  files offers a `FileList`; the pasting side starts a receiver and `Pull`s, and
+  the copier streams the source paths over the FileXfer channel into the peer's
+  download dir, then the landed paths are written back to the local clipboard.
+  Loopback-tested end-to-end (copy file on A → lands on B, clipboard updated).
+  Decisions: eager fetch on copy (paste-time deferral needs the OS render
+  callback), one transfer at a time over the shared channel. *Logic complete;
+  pending the OS backend below + HW validation.*
+- ⬜ OS file-list backend — read/write the actual file clipboard: Windows
+  `CF_HDROP`, X11/Wayland `text/uri-list`. arboard can't reach these, so
+  `ClipboardAccess::read_files`/`write_files` keep no-op defaults until this
+  lands (the handoff above is wired and tested behind it). Native change events
+  to replace polling; Wayland `wlr-data-control`/portal + X11 `INCR` and the
+  `DataStream` path for very large (>16 MB) image transfers.
 
 **Exit:** copy text/image on one machine, paste on the other, both directions.
-**Text path reached.**
+**Text path reached; image + file-paste logic complete, pending HW.**
 
 ---
 
