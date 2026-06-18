@@ -16,6 +16,22 @@ pub struct ProtocolVersion {
 /// clipboard pull, scoped to a session.
 pub type StreamTag = u64;
 
+/// The first frame written on a dedicated stream
+/// ([`Session::open_stream`](../net)), telling the peer how to route it. Lets one
+/// `accept_stream` loop demultiplex independent concurrent transfers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamPurpose {
+    /// A file transfer (drag-and-drop or shared-folder sync). Lands in the
+    /// download dir; the `FileXfer` protocol follows on the same stream.
+    FileTransfer,
+    /// A clipboard file-paste: lands in the download dir *and* updates the local
+    /// file clipboard so an OS paste resolves to the received files.
+    ClipboardFiles,
+    /// A large clipboard payload (e.g. an image too big to inline) pulled over
+    /// its own stream; a single `Clipboard::Data` frame follows.
+    ClipboardData { format: ClipFormat },
+}
+
 // ---------------------------------------------------------------------------
 // Control channel
 // ---------------------------------------------------------------------------
@@ -135,9 +151,9 @@ pub enum FileXfer {
     /// Accept (optionally resuming each file from an offset) or reject.
     Accept { tag: StreamTag, resume: Vec<FileResume> },
     Reject { tag: StreamTag, reason: String },
-    /// A run of bytes for `file_index` starting at `offset`. (In a future
-    /// revision these move to a dedicated per-transfer stream for parallelism;
-    /// carried on the FileXfer channel here so they ride the `Session` API.)
+    /// A run of bytes for `file_index` starting at `offset`. Each transfer now
+    /// runs on its own dedicated stream (`Session::open_stream`, announced by a
+    /// `StreamPurpose` frame), so concurrent transfers don't head-of-line-block.
     Chunk {
         tag: StreamTag,
         file_index: u32,

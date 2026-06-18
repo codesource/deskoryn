@@ -10,9 +10,8 @@
 
 use bytes::BytesMut;
 use deskoryn_clipboard::{ClipboardAccess, LocalClip};
-use deskoryn_core::config::ConflictPolicy;
 use deskoryn_net::transport::{Session, Sink, Source};
-use deskoryn_proto::{decode_one, encode, ClipFormat, ClipPayload, Clipboard};
+use deskoryn_proto::{decode_one, encode, ClipFormat, ClipPayload, Clipboard, StreamPurpose};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -33,26 +32,18 @@ async fn send(sink: &mut Box<dyn Sink>, msg: &Clipboard) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// File-clipboard settings; `Some` enables copy/paste of files (text/image work
-/// regardless). The bytes move over the FileXfer channel, not the clipboard.
-#[derive(Clone)]
-pub struct FileSync {
-    pub download_dir: PathBuf,
-    pub policy: ConflictPolicy,
-}
-
 /// Run the clipboard pump until either side closes.
 ///
 /// `local_changes` yields a [`LocalClip`] whenever the local clipboard changes;
-/// `access` reads/writes the current local content. `session` is used to open the
-/// FileXfer channel for file-clipboard paste (see [`FileSync`]); when `files` is
-/// `None`, file lists are ignored and only text/image sync.
+/// `access` reads/writes the current local content. When `file_sync` is set,
+/// file copies are advertised and (on `Pull`) streamed over a dedicated stream;
+/// the *receiving* side is handled by [`crate::transfer::run_dispatcher`].
 ///
-/// File-paste flow (the bytes ride the FileXfer channel, not the clipboard):
-/// the copier offers `FileList`; the pasting side, on that offer, starts a
-/// receiver and asks (`Pull`) the copier to send; the copier streams the
-/// remembered source paths via [`crate::transfer::send_files`]. Today the fetch
-/// is eager (on copy); true paste-time deferral needs the OS render callback.
+/// File-paste flow (the bytes ride a dedicated stream, not the clipboard): the
+/// copier offers `FileList`; the pasting side `Pull`s; the copier streams the
+/// remembered source paths via [`crate::transfer::send_files`] with a
+/// `ClipboardFiles` purpose. Today the fetch is eager (on copy); true paste-time
+/// deferral needs the OS render callback.
 pub async fn run_clipboard(
     access: Arc<dyn ClipboardAccess>,
     mut local_changes: UnboundedReceiver<LocalClip>,
@@ -60,7 +51,7 @@ pub async fn run_clipboard(
     mut source: Box<dyn Source>,
     inline_max: u64,
     session: Arc<dyn Session>,
-    files: Option<FileSync>,
+    file_sync: bool,
 ) -> anyhow::Result<()> {
     // Source paths we've offered, keyed by the offer's seq, so a later
     // `Pull { FileList }` knows which files to stream.
@@ -75,7 +66,7 @@ pub async fn run_clipboard(
                     // Remember the absolute source paths; advertise the list (the
                     // peer pulls, which triggers the transfer). Skipped if file
                     // sync is disabled or the backend can't read a file list.
-                    if files.is_some() {
+                    if file_sync {
                         if let Some(paths) = access.read_files() {
                             if !paths.is_empty() {
                                 offered_files.insert(change.seq, paths);
@@ -99,10 +90,9 @@ pub async fn run_clipboard(
                     Clipboard::Offer { seq, formats, inline: None } => {
                         let fmt = formats.first().copied();
                         if fmt == Some(ClipFormat::FileList) {
-                            // A file copy on the peer: start a receiver for the
-                            // bytes, then ask the peer to send them.
-                            if let Some(fs) = &files {
-                                spawn_file_receive(session.clone(), access.clone(), fs.clone());
+                            // A file copy on the peer: ask them to send. The bytes
+                            // arrive on a dedicated stream handled by the dispatcher.
+                            if file_sync {
                                 send(&mut sink, &Clipboard::Pull { seq, format: ClipFormat::FileList, tag: seq }).await?;
                             }
                         } else if let Some(fmt) = fmt {
@@ -111,8 +101,8 @@ pub async fn run_clipboard(
                     }
                     Clipboard::Pull { format: ClipFormat::FileList, seq, tag } => {
                         // The peer wants the files we offered under `seq`: stream
-                        // their bytes over the FileXfer channel.
-                        if files.is_some() {
+                        // their bytes over a dedicated `ClipboardFiles` stream.
+                        if file_sync {
                             if let Some(paths) = offered_files.remove(&seq) {
                                 spawn_file_send(session.clone(), tag, paths);
                             }
@@ -120,12 +110,20 @@ pub async fn run_clipboard(
                     }
                     Clipboard::Pull { format, tag, .. } => {
                         if let Some(payload) = access.read(format) {
-                            send(&mut sink, &Clipboard::Data { tag, payload }).await?;
+                            // Large payloads ride their own stream so they don't
+                            // head-of-line-block the clipboard channel; small ones
+                            // reply inline. (>16 MB still needs chunking — future.)
+                            if payload_len(&payload) as u64 > inline_max {
+                                spawn_clip_data_send(session.clone(), format, payload);
+                            } else {
+                                send(&mut sink, &Clipboard::Data { tag, payload }).await?;
+                            }
                         }
                     }
                     Clipboard::Data { payload, .. } => access.write(payload),
                     Clipboard::DataStream { .. } => {
-                        // TODO(impl): pull a large payload over a dedicated stream.
+                        // Superseded by dedicated streams (StreamPurpose::ClipboardData,
+                        // handled by the dispatcher); kept for wire compatibility.
                     }
                 }
             }
@@ -133,27 +131,43 @@ pub async fn run_clipboard(
     }
 }
 
-/// Stream `paths` to the peer over the FileXfer channel (sender side of a
-/// file-paste). Spawned so the clipboard pump keeps syncing during the transfer.
-fn spawn_file_send(session: Arc<dyn Session>, tag: u64, paths: Vec<PathBuf>) {
+/// Send a large pulled payload to the peer over a dedicated `ClipboardData`
+/// stream (its purpose frame then one `Data` frame), so it doesn't block the
+/// shared clipboard channel. The receiver's dispatcher writes it to the clipboard.
+fn spawn_clip_data_send(session: Arc<dyn Session>, format: ClipFormat, payload: ClipPayload) {
     tokio::spawn(async move {
-        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
-        if let Err(e) = crate::transfer::send_files(session.as_ref(), tag, &refs).await {
-            tracing::warn!(error = %e, "clipboard file-send failed");
+        let (mut sink, _source) = match session.open_stream().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "open_stream for clipboard data failed");
+                return;
+            }
+        };
+        let mut purpose = BytesMut::new();
+        let mut data = BytesMut::new();
+        if encode(&StreamPurpose::ClipboardData { format }, &mut purpose).is_err()
+            || encode(&Clipboard::Data { tag: 0, payload }, &mut data).is_err()
+        {
+            tracing::warn!("clipboard payload too large to encode for a stream");
+            return;
+        }
+        if let Err(e) = async { sink.send_bytes(&purpose).await?; sink.send_bytes(&data).await }.await {
+            tracing::warn!(error = %e, "clipboard large-payload send failed");
         }
     });
 }
 
-/// Receive the peer's files into the download dir, then put the landed paths on
-/// the local clipboard so an OS paste resolves to real files (receiver side).
-fn spawn_file_receive(session: Arc<dyn Session>, access: Arc<dyn ClipboardAccess>, fs: FileSync) {
+/// Stream `paths` to the peer over a dedicated `ClipboardFiles` stream (sender
+/// side of a file-paste). Spawned so the clipboard pump keeps syncing during the
+/// transfer; the receiver's dispatcher lands them and updates its clipboard.
+fn spawn_file_send(session: Arc<dyn Session>, tag: u64, paths: Vec<PathBuf>) {
     tokio::spawn(async move {
-        match crate::transfer::receive(session.as_ref(), &fs.download_dir, fs.policy).await {
-            Ok(landed) => {
-                tracing::info!(count = landed.len(), dir = %fs.download_dir.display(), "clipboard file-paste received");
-                access.write_files(&landed);
-            }
-            Err(e) => tracing::warn!(error = %e, "clipboard file-receive failed"),
+        let refs: Vec<&std::path::Path> = paths.iter().map(|p| p.as_path()).collect();
+        if let Err(e) =
+            crate::transfer::send_files(session.as_ref(), StreamPurpose::ClipboardFiles, tag, &refs)
+                .await
+        {
+            tracing::warn!(error = %e, "clipboard file-send failed");
         }
     });
 }
@@ -192,8 +206,8 @@ mod tests {
 
         let a: Arc<dyn ClipboardAccess> = acc_a;
         let b: Arc<dyn ClipboardAccess> = acc_b;
-        let pa = tokio::spawn(run_clipboard(a, rx_a, tx_a, rx_src_a, 256 * 1024, sa.clone(), None));
-        let pb = tokio::spawn(run_clipboard(b, rx_b, tx_b, rx_src_b, 256 * 1024, sb.clone(), None));
+        let pa = tokio::spawn(run_clipboard(a, rx_a, tx_a, rx_src_a, 256 * 1024, sa.clone(), false));
+        let pb = tokio::spawn(run_clipboard(b, rx_b, tx_b, rx_src_b, 256 * 1024, sb.clone(), false));
 
         // Copy on A → appears on B.
         inj_a.copy_text("hello from A");
@@ -232,14 +246,17 @@ mod tests {
         let (tx_a, rx_src_a) = sa.channel(Channel::Clipboard).await.unwrap();
         let (tx_b, rx_src_b) = sb.channel(Channel::Clipboard).await.unwrap();
 
-        let fs = FileSync { download_dir: dl.clone(), policy: ConflictPolicy::Rename };
         let a: Arc<dyn ClipboardAccess> = acc_a;
         let b: Arc<dyn ClipboardAccess> = acc_b;
-        let pa = tokio::spawn(run_clipboard(a, rx_a, tx_a, rx_src_a, 256 * 1024, sa.clone(), Some(fs.clone())));
-        let pb = tokio::spawn(run_clipboard(b, rx_b, tx_b, rx_src_b, 256 * 1024, sb.clone(), Some(fs.clone())));
+        let pa = tokio::spawn(run_clipboard(a, rx_a, tx_a, rx_src_a, 256 * 1024, sa.clone(), true));
+        let pb = tokio::spawn(run_clipboard(b.clone(), rx_b, tx_b, rx_src_b, 256 * 1024, sb.clone(), true));
+        // B's dispatcher accepts the incoming ClipboardFiles stream, lands the
+        // files, and updates B's clipboard.
+        let download = Some((dl.clone(), deskoryn_core::config::ConflictPolicy::Rename));
+        let pd = tokio::spawn(crate::transfer::run_dispatcher(sb.clone(), Some(b), download));
 
-        // Copy a file on A → it transfers over FileXfer and lands in B's download
-        // dir, and B's clipboard receives the landed paths (ready to paste).
+        // Copy a file on A → it transfers over a dedicated stream and lands in B's
+        // download dir, and B's clipboard receives the landed paths (ready to paste).
         inj_a.copy_files(vec![src.join("note.txt")]);
 
         let mut landed: Option<Vec<PathBuf>> = None;
@@ -257,7 +274,47 @@ mod tests {
 
         pa.abort();
         pb.abort();
+        pd.abort();
         let _ = std::fs::remove_dir_all(&src);
         let _ = std::fs::remove_dir_all(&dl);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn large_payload_pulled_over_dedicated_stream() {
+        let (acc_a, inj_a, rx_a) = memory();
+        let (acc_b, inj_b, rx_b) = memory();
+
+        let (sa, sb) = loopback::loopback(DeviceId::from_bytes([1; 16]), DeviceId::from_bytes([2; 16]));
+        let sa: Arc<dyn Session> = Arc::new(sa);
+        let sb: Arc<dyn Session> = Arc::new(sb);
+        let (tx_a, rx_src_a) = sa.channel(Channel::Clipboard).await.unwrap();
+        let (tx_b, rx_src_b) = sb.channel(Channel::Clipboard).await.unwrap();
+
+        // inline_max = 1 KiB so our 64 KiB "image" must ride a dedicated stream.
+        let a: Arc<dyn ClipboardAccess> = acc_a;
+        let b: Arc<dyn ClipboardAccess> = acc_b;
+        let pa = tokio::spawn(run_clipboard(a, rx_a, tx_a, rx_src_a, 1024, sa.clone(), false));
+        let pb = tokio::spawn(run_clipboard(b.clone(), rx_b, tx_b, rx_src_b, 1024, sb.clone(), false));
+        // B pulls; A opens a ClipboardData stream to send the payload; B's
+        // dispatcher accepts it and writes it to B's clipboard.
+        let pd = tokio::spawn(crate::transfer::run_dispatcher(sb.clone(), Some(b), None));
+
+        let big = vec![0xABu8; 64 * 1024];
+        inj_a.copy_image(big.clone());
+
+        let mut ok = false;
+        for _ in 0..300 {
+            if let Some(ClipPayload::Bytes(got)) = inj_b.current() {
+                assert_eq!(got, big);
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ok, "large image did not arrive on B via dedicated stream");
+
+        pa.abort();
+        pb.abort();
+        pd.abort();
     }
 }

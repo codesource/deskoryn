@@ -14,13 +14,71 @@
 #![allow(dead_code)]
 
 use bytes::BytesMut;
+use deskoryn_clipboard::ClipboardAccess;
 use deskoryn_core::config::ConflictPolicy;
 use deskoryn_filexfer::manifest;
 use deskoryn_filexfer::progress::ProgressTracker;
 use deskoryn_filexfer::sink::FileSink;
 use deskoryn_net::transport::{Session, Sink, Source};
-use deskoryn_proto::{decode_one, encode, Channel, FileXfer, StreamTag};
+use deskoryn_proto::{decode_one, encode, Clipboard, FileXfer, StreamPurpose, StreamTag};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Accept dedicated streams for the session's lifetime and route each by its
+/// leading [`StreamPurpose`]: file transfers and clipboard file-pastes land in
+/// `download` (the paste also updates the local file clipboard), and a large
+/// clipboard payload is written straight to the clipboard. Each stream is
+/// handled on its own task, so transfers run concurrently.
+pub async fn run_dispatcher(
+    session: Arc<dyn Session>,
+    clipboard: Option<Arc<dyn ClipboardAccess>>,
+    download: Option<(PathBuf, ConflictPolicy)>,
+) -> anyhow::Result<()> {
+    loop {
+        let Some((sink, mut source)) = session.accept_stream().await? else {
+            return Ok(());
+        };
+        let purpose = read_purpose(&mut source).await?;
+        match purpose {
+            Some(StreamPurpose::FileTransfer) => {
+                let Some((dir, policy)) = download.clone() else { continue };
+                tokio::spawn(async move {
+                    if let Err(e) = receive_on_stream(sink, source, &dir, policy).await {
+                        tracing::warn!(error = %e, "file transfer receive failed");
+                    }
+                });
+            }
+            Some(StreamPurpose::ClipboardFiles) => {
+                let (Some((dir, policy)), Some(clip)) = (download.clone(), clipboard.clone())
+                else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    match receive_on_stream(sink, source, &dir, policy).await {
+                        Ok(landed) => {
+                            tracing::info!(count = landed.len(), "clipboard file-paste received");
+                            clip.write_files(&landed);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "clipboard file-receive failed"),
+                    }
+                });
+            }
+            Some(StreamPurpose::ClipboardData { .. }) => {
+                let Some(clip) = clipboard.clone() else { continue };
+                tokio::spawn(async move {
+                    // A large clipboard payload: a single Data frame follows.
+                    if let Ok(Some(frame)) = source.recv_bytes().await {
+                        let mut b = BytesMut::from(&frame[..]);
+                        if let Ok(Some(Clipboard::Data { payload, .. })) = decode_one::<Clipboard>(&mut b) {
+                            clip.write(payload);
+                        }
+                    }
+                });
+            }
+            None => {} // stream closed before announcing its purpose
+        }
+    }
+}
 
 /// Bytes per `Chunk`. 64 KiB balances framing overhead against memory.
 const CHUNK: usize = 64 * 1024;
@@ -30,6 +88,26 @@ async fn send_msg(sink: &mut Box<dyn Sink>, msg: &FileXfer) -> anyhow::Result<()
     encode(msg, &mut buf)?;
     sink.send_bytes(&buf).await?;
     Ok(())
+}
+
+/// Write the leading [`StreamPurpose`] frame that tells the peer's
+/// `accept_stream` dispatcher how to route this dedicated stream.
+async fn send_purpose(sink: &mut Box<dyn Sink>, purpose: StreamPurpose) -> anyhow::Result<()> {
+    let mut buf = BytesMut::new();
+    encode(&purpose, &mut buf)?;
+    sink.send_bytes(&buf).await?;
+    Ok(())
+}
+
+/// Read that leading [`StreamPurpose`] frame off a freshly accepted stream.
+pub async fn read_purpose(source: &mut Box<dyn Source>) -> anyhow::Result<Option<StreamPurpose>> {
+    match source.recv_bytes().await? {
+        Some(frame) => {
+            let mut b = BytesMut::from(&frame[..]);
+            Ok(decode_one::<StreamPurpose>(&mut b)?)
+        }
+        None => Ok(None),
+    }
 }
 
 async fn recv_msg(source: &mut Box<dyn Source>) -> anyhow::Result<Option<FileXfer>> {
@@ -42,11 +120,19 @@ async fn recv_msg(source: &mut Box<dyn Source>) -> anyhow::Result<Option<FileXfe
     }
 }
 
-/// Offer `roots` to the peer and stream their contents. Returns when the peer
-/// has acknowledged the whole set (or rejected it).
-pub async fn send_files(session: &dyn Session, tag: StreamTag, roots: &[&Path]) -> anyhow::Result<()> {
+/// Offer `roots` to the peer and stream their contents over a **dedicated
+/// stream** (so concurrent transfers never head-of-line-block each other).
+/// `purpose` is the leading frame the peer routes on. Returns when the peer has
+/// acknowledged the whole set (or rejected it).
+pub async fn send_files(
+    session: &dyn Session,
+    purpose: StreamPurpose,
+    tag: StreamTag,
+    roots: &[&Path],
+) -> anyhow::Result<()> {
     let manifest = tokio::task::block_in_place(|| manifest::build(roots))?;
-    let (mut sink, mut source) = session.channel(Channel::FileXfer).await?;
+    let (mut sink, mut source) = session.open_stream().await?;
+    send_purpose(&mut sink, purpose).await?;
 
     send_msg(&mut sink, &FileXfer::Offer { tag, manifest: manifest.clone() }).await?;
 
@@ -108,15 +194,15 @@ async fn stream_files(
     Ok(())
 }
 
-/// Accept an incoming offer and write the files under `download_dir`. Returns
-/// the paths written.
-pub async fn receive(
-    session: &dyn Session,
+/// Accept an offer that has already arrived on a dedicated stream (its
+/// [`StreamPurpose`] consumed by the dispatcher) and write the files under
+/// `download_dir`. Returns the paths written.
+pub async fn receive_on_stream(
+    mut sink: Box<dyn Sink>,
+    mut source: Box<dyn Source>,
     download_dir: &Path,
     policy: ConflictPolicy,
 ) -> anyhow::Result<Vec<PathBuf>> {
-    let (mut sink, mut source) = session.channel(Channel::FileXfer).await?;
-
     let manifest = match recv_msg(&mut source).await? {
         Some(FileXfer::Offer { tag, manifest }) => {
             // Accept everything from the start (no resume yet).
@@ -247,7 +333,7 @@ async fn send_impl(
     let session = endpoint.connect_any(socket).await?;
     let refs: Vec<&Path> = files.iter().map(|p| p.as_path()).collect();
     println!("Sending {} item(s) …", refs.len());
-    send_files(session.as_ref(), 1, &refs).await?;
+    send_files(session.as_ref(), StreamPurpose::FileTransfer, 1, &refs).await?;
     session.close("transfer complete").await;
     println!("Done.");
     Ok(())
@@ -281,7 +367,14 @@ async fn receive_impl(
         download.display()
     );
     let session = endpoint.accept().await?;
-    let got = receive(session.as_ref(), &download, config.file_transfer.conflict_policy).await?;
+    let (sink, mut source) = session
+        .accept_stream()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("peer closed before opening a transfer stream"))?;
+    let purpose = read_purpose(&mut source).await?;
+    tracing::debug!(?purpose, "incoming transfer stream");
+    let got =
+        receive_on_stream(sink, source, &download, config.file_transfer.conflict_policy).await?;
     println!("Received {} file(s):", got.len());
     for p in &got {
         println!("  {}", p.display());
@@ -322,11 +415,17 @@ mod tests {
 
         let src_for_send = src.clone();
         let sender = tokio::spawn(async move {
-            send_files(sa.as_ref(), 1, &[src_for_send.as_path()]).await
+            send_files(sa.as_ref(), StreamPurpose::FileTransfer, 1, &[src_for_send.as_path()]).await
         });
 
+        // Receiver: accept the dedicated stream, read its purpose, then receive.
+        let (sink, mut source) = sb.accept_stream().await.unwrap().unwrap();
+        let purpose = read_purpose(&mut source).await.unwrap();
+        assert_eq!(purpose, Some(StreamPurpose::FileTransfer));
         let dl_for_recv = dl.clone();
-        let received = receive(sb.as_ref(), &dl_for_recv, ConflictPolicy::Rename).await.unwrap();
+        let received = receive_on_stream(sink, source, &dl_for_recv, ConflictPolicy::Rename)
+            .await
+            .unwrap();
         sender.await.unwrap().unwrap();
 
         // Two files received with identical contents.

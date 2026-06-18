@@ -27,7 +27,7 @@ use deskoryn_proto::Channel;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
@@ -274,6 +274,9 @@ pub struct QuicSession {
     fingerprint: CertFingerprint,
     conn: quinn::Connection,
     streams: Mutex<HashMap<u8, StreamSlot>>,
+    /// Peer-initiated dedicated streams (those opened after the fixed per-channel
+    /// set), fed by a background `accept_bi` task and drained by `accept_stream`.
+    incoming: Mutex<mpsc::Receiver<(quinn::SendStream, quinn::RecvStream)>>,
 }
 
 impl QuicSession {
@@ -301,11 +304,27 @@ impl QuicSession {
                 streams.insert(tag[0], (Some(send), Some(recv)));
             }
         }
+        // The fixed per-channel streams are now established (opened by the client,
+        // tag-routed by the server). Any *further* bidirectional stream is a
+        // dedicated transfer stream: a background task accepts them and feeds the
+        // `accept_stream` queue. Spawned after the initial set so the two never
+        // race on `accept_bi`.
+        let (inc_tx, inc_rx) = mpsc::channel(64);
+        let accept_conn = conn.clone();
+        tokio::spawn(async move {
+            while let Ok(pair) = accept_conn.accept_bi().await {
+                if inc_tx.send(pair).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             peer,
             fingerprint,
             conn,
             streams: Mutex::new(streams),
+            incoming: Mutex::new(inc_rx),
         })
     }
 
@@ -341,6 +360,23 @@ impl Session for QuicSession {
         let send = slot.0.take().ok_or(SessionError::NoChannel(channel))?;
         let recv = slot.1.take().ok_or(SessionError::NoChannel(channel))?;
         Ok((Box::new(QuicSink(send)), Box::new(QuicSource(recv))))
+    }
+
+    async fn open_stream(&self) -> Result<(Box<dyn Sink>, Box<dyn Source>), SessionError> {
+        // A fresh bidirectional stream, no channel tag — the peer's background
+        // accept task routes it to `accept_stream`, and the caller writes a
+        // `StreamPurpose` frame first.
+        let (send, recv) = self.conn.open_bi().await.map_err(te)?;
+        Ok((Box::new(QuicSink(send)), Box::new(QuicSource(recv))))
+    }
+
+    async fn accept_stream(
+        &self,
+    ) -> Result<Option<(Box<dyn Sink>, Box<dyn Source>)>, SessionError> {
+        match self.incoming.lock().await.recv().await {
+            Some((send, recv)) => Ok(Some((Box::new(QuicSink(send)), Box::new(QuicSource(recv))))),
+            None => Ok(None),
+        }
     }
 
     async fn send_datagram(&self, bytes: &[u8]) -> Result<(), SessionError> {

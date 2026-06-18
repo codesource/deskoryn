@@ -76,6 +76,16 @@ impl ClipInjector {
         });
     }
 
+    /// Simulate a local "copy image" (PNG bytes), notifying any watcher.
+    pub fn copy_image(&self, bytes: Vec<u8>) {
+        self.shared.lock().unwrap().content = Some(ClipPayload::Bytes(bytes));
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let _ = self.tx.send(LocalClip {
+            seq,
+            formats: vec![ClipFormat::Png],
+        });
+    }
+
     /// Simulate a local "copy files", notifying any watcher with a `FileList`.
     pub fn copy_files(&self, paths: Vec<PathBuf>) {
         self.shared.lock().unwrap().files = Some(paths);

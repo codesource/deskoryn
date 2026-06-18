@@ -65,42 +65,52 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
     let control = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default());
     let input = crate::input::run_input(session.as_ref(), controller, capture, injector);
 
-    // Clipboard sync (text + images; files via the FileXfer channel). Bridge the
-    // local OS clipboard to the peer over the Clipboard channel; skipped entirely
-    // when all clipboard sync is disabled. When the portable/no-op backend is
-    // selected the pump simply parks (idle stream).
+    // Clipboard sync (text + images on the Clipboard channel; files stream over
+    // dedicated streams). Skipped entirely when all clipboard sync is disabled;
+    // with the portable/no-op backend the pump simply parks (idle stream).
     let clip = &config.clipboard;
     type PumpFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
-    let clipboard: PumpFuture = if clip.sync_text || clip.sync_images || clip.sync_files {
-        let (clip_sink, clip_source) = session.channel(Channel::Clipboard).await?;
-        let (clip_access, clip_changes) = deskoryn_clipboard::platform::open_access(
-            std::time::Duration::from_millis(clip.poll_ms),
-        );
-        let files = clip.sync_files.then(|| crate::clipboard::FileSync {
-            download_dir: config
+    type ClipAccess = std::sync::Arc<dyn deskoryn_clipboard::ClipboardAccess>;
+    let (clip_access, clipboard): (Option<ClipAccess>, PumpFuture) =
+        if clip.sync_text || clip.sync_images || clip.sync_files {
+            let (clip_sink, clip_source) = session.channel(Channel::Clipboard).await?;
+            let (access, clip_changes) = deskoryn_clipboard::platform::open_access(
+                std::time::Duration::from_millis(clip.poll_ms),
+            );
+            let fut = Box::pin(crate::clipboard::run_clipboard(
+                access.clone(),
+                clip_changes,
+                clip_sink,
+                clip_source,
+                clip.inline_max_bytes,
+                session.clone(),
+                clip.sync_files,
+            ));
+            (Some(access), fut)
+        } else {
+            (None, Box::pin(std::future::pending()))
+        };
+
+    // Dispatcher: accepts dedicated streams (file transfers + clipboard
+    // file-paste) for the session lifetime, each handled concurrently.
+    let download = clip.sync_files.then(|| {
+        (
+            config
                 .file_transfer
                 .download_dir
                 .clone()
                 .unwrap_or_else(|| std::env::temp_dir().join("deskoryn-received")),
-            policy: config.file_transfer.conflict_policy,
-        });
-        Box::pin(crate::clipboard::run_clipboard(
-            clip_access,
-            clip_changes,
-            clip_sink,
-            clip_source,
-            clip.inline_max_bytes,
-            session.clone(),
-            files,
-        ))
-    } else {
-        Box::pin(std::future::pending())
-    };
+            config.file_transfer.conflict_policy,
+        )
+    });
+    let dispatcher: PumpFuture =
+        Box::pin(crate::transfer::run_dispatcher(session.clone(), clip_access, download));
 
     let end = tokio::select! {
         r = control => { r.map(|e| format!("{e:?}")) }
         r = input => { r.map(|_| "input pump ended".to_string()) }
         r = clipboard => { r.map(|_| "clipboard pump ended".to_string()) }
+        r = dispatcher => { r.map(|_| "stream dispatcher ended".to_string()) }
     }?;
     tracing::info!(%peer, %end, "session ended");
     Ok(())

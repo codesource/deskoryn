@@ -107,6 +107,45 @@ async fn mutual_auth_handshake_and_datagram() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_streams_open_and_accept() {
+    let id_a = DeviceId::generate();
+    let id_b = DeviceId::generate();
+    let identity_a = Arc::new(DeviceIdentity::generate(id_a).unwrap());
+    let identity_b = Arc::new(DeviceIdentity::generate(id_b).unwrap());
+    let trust_a = Arc::new(Mutex::new(trust_of(id_b, &identity_b, "b")));
+    let trust_b = Arc::new(Mutex::new(trust_of(id_a, &identity_a, "a")));
+
+    let ep_b = QuicEndpoint::bind(0, identity_b, trust_b).await.unwrap();
+    let port_b = ep_b.local_port();
+    let ep_a = QuicEndpoint::bind(0, identity_a, trust_a).await.unwrap();
+
+    // Server accepts a dedicated stream (beyond the fixed channels) and echoes.
+    let server = tokio::spawn(async move {
+        let session = ep_b.accept().await.expect("accept");
+        let (mut sink, mut source) = session.accept_stream().await.unwrap().expect("stream");
+        let frame = source.recv_bytes().await.unwrap().expect("frame");
+        sink.send_bytes(&frame).await.unwrap(); // echo back
+        // Hold the session open until the client has read the echo.
+        let _ = source.recv_bytes().await;
+    });
+
+    let addr = format!("127.0.0.1:{port_b}").parse().unwrap();
+    let session = ep_a.connect(addr, id_b).await.expect("connect");
+
+    let (mut sink, mut source) = session.open_stream().await.unwrap();
+    let mut payload = BytesMut::new();
+    payload.extend_from_slice(&(5u32.to_be_bytes()));
+    payload.extend_from_slice(b"hello");
+    sink.send_bytes(&payload).await.unwrap();
+
+    let echoed = source.recv_bytes().await.unwrap().expect("echo");
+    assert_eq!(&echoed[..], &payload[..], "dedicated stream round-trips a frame");
+
+    drop(session);
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rejects_unpaired_peer() {
     let id_a = DeviceId::generate();
     let id_b = DeviceId::generate();

@@ -132,8 +132,15 @@ tuning/polish and the optional alt backends, not blockers.
 - ✅ Transfer pump (`daemon::transfer`): manifest → accept → `Chunk` stream →
   complete, with hashing, conflict policy, resume offsets, path-traversal guard,
   progress. Tested transferring a directory tree over the session.
-- ⬜ Drag-and-drop + file-clipboard paste (`CF_HDROP` ⇄ file list) triggers;
-  tray progress UI; dedicated per-transfer streams for parallelism.
+- ✅ Dedicated per-transfer streams (`Session::open_stream`/`accept_stream`,
+  routed by a `StreamPurpose` frame): each file transfer / clipboard file-paste
+  runs on its own stream, so concurrent transfers no longer head-of-line-block
+  each other or the channels. A session-level `run_dispatcher` accepts streams
+  and routes them (file transfer, clipboard files, large clipboard payload).
+  Implemented for both loopback and real QUIC (`open_bi` + background accept
+  task); round-trip tested on both.
+- ✅ File-clipboard paste trigger (`CF_HDROP` ⇄ file list) — landed in M3.
+- ⬜ Drag-and-drop triggers; tray progress UI.
 
 **Exit:** drag a folder across the boundary; it lands with names/metadata intact,
 resumes after an interruption, shows progress.
