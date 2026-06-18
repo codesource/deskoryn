@@ -253,7 +253,7 @@ mod tests {
         // B's dispatcher accepts the incoming ClipboardFiles stream, lands the
         // files, and updates B's clipboard.
         let download = Some((dl.clone(), deskoryn_core::config::ConflictPolicy::Rename));
-        let pd = tokio::spawn(crate::transfer::run_dispatcher(sb.clone(), Some(b), download));
+        let pd = tokio::spawn(crate::transfer::run_dispatcher(sb.clone(), Some(b), download, 8));
 
         // Copy a file on A → it transfers over a dedicated stream and lands in B's
         // download dir, and B's clipboard receives the landed paths (ready to paste).
@@ -297,7 +297,7 @@ mod tests {
         let pb = tokio::spawn(run_clipboard(b.clone(), rx_b, tx_b, rx_src_b, 1024, sb.clone(), false));
         // B pulls; A opens a ClipboardData stream to send the payload; B's
         // dispatcher accepts it and writes it to B's clipboard.
-        let pd = tokio::spawn(crate::transfer::run_dispatcher(sb.clone(), Some(b), None));
+        let pd = tokio::spawn(crate::transfer::run_dispatcher(sb.clone(), Some(b), None, 8));
 
         let big = vec![0xABu8; 64 * 1024];
         inj_a.copy_image(big.clone());

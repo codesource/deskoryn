@@ -181,7 +181,12 @@ reverse direction.
 - ✅ Wire-decoder hardening: a stable "never panic on garbage" sweep plus a
   cargo-fuzz target (`fuzz/`).
 - ✅ Packaging/autostart scaffolds (`packaging/`).
-- ⬜ Sync *execution* wired to the transfer pump; resource limits; `.deb`/MSI
+- ✅ Transfer resource limit: the stream dispatcher caps simultaneously-running
+  incoming transfers (`file_transfer.max_concurrent_transfers`, default 8) via a
+  semaphore — a peer's burst of streams queues instead of fanning out unbounded
+  tasks. Tested: N transfers all deliver under a cap of 2.
+- ⬜ Sync *execution* wired to the transfer pump (planning + dedicated streams
+  exist; needs a manifest-exchange handshake + folder-aware landing); `.deb`/MSI
   packaging + signing.
 
 ---

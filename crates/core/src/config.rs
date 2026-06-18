@@ -208,6 +208,15 @@ pub struct FileTransferConfig {
     pub conflict_policy: ConflictPolicy,
     /// Optional two-way synced folder pair (local path, peer path).
     pub shared_folders: Vec<SharedFolder>,
+    /// Cap on simultaneously-running incoming transfers (each peer-opened
+    /// dedicated stream takes a slot; further streams wait for one). Bounds
+    /// memory/disk churn and task fan-out from a misbehaving or busy peer.
+    #[serde(default = "default_max_concurrent_transfers")]
+    pub max_concurrent_transfers: usize,
+}
+
+fn default_max_concurrent_transfers() -> usize {
+    8
 }
 
 impl Default for FileTransferConfig {
@@ -216,6 +225,7 @@ impl Default for FileTransferConfig {
             download_dir: None,
             conflict_policy: ConflictPolicy::Rename,
             shared_folders: Vec::new(),
+            max_concurrent_transfers: default_max_concurrent_transfers(),
         }
     }
 }

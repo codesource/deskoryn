@@ -103,8 +103,12 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
             config.file_transfer.conflict_policy,
         )
     });
-    let dispatcher: PumpFuture =
-        Box::pin(crate::transfer::run_dispatcher(session.clone(), clip_access, download));
+    let dispatcher: PumpFuture = Box::pin(crate::transfer::run_dispatcher(
+        session.clone(),
+        clip_access,
+        download,
+        config.file_transfer.max_concurrent_transfers,
+    ));
 
     let end = tokio::select! {
         r = control => { r.map(|e| format!("{e:?}")) }

@@ -33,16 +33,25 @@ pub async fn run_dispatcher(
     session: Arc<dyn Session>,
     clipboard: Option<Arc<dyn ClipboardAccess>>,
     download: Option<(PathBuf, ConflictPolicy)>,
+    max_concurrent: usize,
 ) -> anyhow::Result<()> {
+    // Bound simultaneously-running transfers: each handler holds a permit for its
+    // lifetime, so a peer opening a burst of streams queues rather than spawning
+    // unbounded tasks. `max(1)` guards against a zero from config.
+    let limit = Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1)));
     loop {
         let Some((sink, mut source)) = session.accept_stream().await? else {
             return Ok(());
         };
         let purpose = read_purpose(&mut source).await?;
+        // Acquire after reading the (cheap) purpose; if we're at the cap this
+        // awaits — applying backpressure to further accepts too.
+        let permit = limit.clone().acquire_owned().await.expect("semaphore not closed");
         match purpose {
             Some(StreamPurpose::FileTransfer) => {
                 let Some((dir, policy)) = download.clone() else { continue };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = receive_on_stream(sink, source, &dir, policy).await {
                         tracing::warn!(error = %e, "file transfer receive failed");
                     }
@@ -54,6 +63,7 @@ pub async fn run_dispatcher(
                     continue;
                 };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     match receive_on_stream(sink, source, &dir, policy).await {
                         Ok(landed) => {
                             tracing::info!(count = landed.len(), "clipboard file-paste received");
@@ -66,6 +76,7 @@ pub async fn run_dispatcher(
             Some(StreamPurpose::ClipboardData { .. }) => {
                 let Some(clip) = clipboard.clone() else { continue };
                 tokio::spawn(async move {
+                    let _permit = permit;
                     // A large clipboard payload: a single Data frame follows.
                     if let Ok(Some(frame)) = source.recv_bytes().await {
                         let mut b = BytesMut::from(&frame[..]);
@@ -388,6 +399,7 @@ mod tests {
     use deskoryn_core::DeviceId;
     use deskoryn_net::transport::loopback;
     use std::io::Write;
+    use std::time::Duration;
 
     fn tmpdir(tag: &str) -> PathBuf {
         // Deterministic, test-local temp dir (no clock/random needed).
@@ -435,6 +447,63 @@ mod tests {
         let got_b = std::fs::read(dl.join("payload/sub/b.bin")).unwrap();
         assert_eq!(got_b, big);
 
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&dl);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatcher_delivers_all_transfers_under_concurrency_cap() {
+        // More concurrent transfers than the cap → they queue, but all deliver.
+        let root = tmpdir("multisrc");
+        let n = 6usize;
+        let mut files = Vec::new();
+        for i in 0..n {
+            let p = root.join(format!("f{i}.txt"));
+            std::fs::write(&p, format!("payload-{i}")).unwrap();
+            files.push(p);
+        }
+        let dl = tmpdir("multidl");
+
+        let (sa, sb) = loopback::loopback(DeviceId::from_bytes([1; 16]), DeviceId::from_bytes([2; 16]));
+        let sa: Arc<dyn Session> = Arc::new(sa);
+        let sb: Arc<dyn Session> = Arc::new(sb);
+
+        // Receiver dispatcher capped at 2 concurrent transfers.
+        let disp = tokio::spawn(run_dispatcher(
+            sb.clone(),
+            None,
+            Some((dl.clone(), ConflictPolicy::Rename)),
+            2,
+        ));
+
+        // Fire all N transfers at once, each on its own dedicated stream.
+        let mut senders = Vec::new();
+        for f in &files {
+            let sa2 = sa.clone();
+            let f2 = f.clone();
+            senders.push(tokio::spawn(async move {
+                send_files(sa2.as_ref(), StreamPurpose::FileTransfer, 1, &[f2.as_path()]).await
+            }));
+        }
+        for s in senders {
+            s.await.unwrap().unwrap();
+        }
+
+        // Every file lands despite the cap (queued, not dropped).
+        for i in 0..n {
+            let want = dl.join(format!("f{i}.txt"));
+            let mut ok = false;
+            for _ in 0..300 {
+                if want.exists() && std::fs::read(&want).unwrap() == format!("payload-{i}").as_bytes() {
+                    ok = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(ok, "f{i}.txt did not arrive under the concurrency cap");
+        }
+
+        disp.abort();
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&dl);
     }
