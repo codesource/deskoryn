@@ -1,6 +1,23 @@
 //! Audio backend selection, device enumeration, and a pass-through codec.
 
 use crate::{AudioDevice, AudioError, Codec};
+use deskoryn_core::config::AudioProfile;
+
+/// Pick the best codec for this build: the real Opus codec when the `opus`
+/// feature is enabled (falling back to passthrough if the encoder can't be
+/// created for the given format), otherwise the passthrough codec. This is the
+/// single selection point the daemon's audio pump uses.
+pub fn open_codec(sample_rate: u32, channels: u8, profile: AudioProfile) -> Box<dyn Codec> {
+    #[cfg(feature = "opus")]
+    {
+        match opus_codec::OpusCodec::new(sample_rate, channels, profile) {
+            Ok(c) => return Box::new(c),
+            Err(e) => tracing::warn!(error = %e, "opus codec unavailable; using passthrough"),
+        }
+    }
+    let _ = (sample_rate, channels, profile);
+    Box::new(PassthroughCodec)
+}
 
 /// Enumerate capture devices (sources). Real backends query PipeWire/WASAPI; the
 /// default build returns just a synthetic "default" so the UI has something.

@@ -152,8 +152,14 @@ resumes after an interruption, shows progress.
 - ✅ Audio pipeline (`daemon::audio`): capture → codec → datagrams → jitter
   buffer (profile-sized, gap-concealing) → playback. Tested with a passthrough
   codec over the loopback session.
+- ✅ Real Opus codec wired (`audio::platform::open_codec`, behind the `opus` /
+  daemon `audio-opus` feature): selects `OpusCodec` (libopus via `audiopus`,
+  VoIP/Audio app per profile, PLC on loss) with a passthrough fallback. Verified
+  on Linux with `libopus-dev`: codec round-trip + the full capture→encode→
+  datagram→jitter→decode pipeline through real Opus over loopback. Windows Opus
+  needs a cross/native libopus build (tracked below).
 - ⬜ OS backends — WASAPI loopback (Windows) / PipeWire monitor + virtual sink
-  (Linux); real Opus codec (`opus` feature); device pickers.
+  (Linux); device pickers; Windows libopus build for the `.exe`.
 
 **Exit:** Windows audio plays on Linux speakers with selectable latency; optional
 reverse direction.

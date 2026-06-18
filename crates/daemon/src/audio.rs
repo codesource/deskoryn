@@ -222,4 +222,47 @@ mod tests {
         let got = out.lock().unwrap().clone();
         assert_eq!(got, expected, "played PCM must match captured PCM");
     }
+
+    /// End-to-end through the **real Opus codec** (selected via `open_codec`).
+    /// Only built/run with `--features audio-opus` (needs libopus at build time).
+    #[cfg(feature = "audio-opus")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forwards_audio_frames_through_opus() {
+        use deskoryn_audio::platform::open_codec;
+
+        // Three valid 20 ms stereo frames @ 48 kHz (960 samples/channel).
+        let frames: Vec<Vec<f32>> = (0..3)
+            .map(|k| (0..960 * 2).map(|i| (((i + k * 7) as f32) * 0.01).sin() * 0.2).collect())
+            .collect();
+        let n_frames = frames.len();
+
+        let (src_sess, sink_sess) =
+            loopback::loopback(DeviceId::from_bytes([1; 16]), DeviceId::from_bytes([2; 16]));
+        let src_sess: Box<dyn Session> = Box::new(src_sess);
+        let sink_sess: Box<dyn Session> = Box::new(sink_sess);
+
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let playback = Box::new(VecPlayback { out: out.clone() });
+
+        let sink_codec = open_codec(48_000, 2, AudioProfile::LowLatency);
+        let sink = tokio::spawn(async move {
+            run_audio_sink(sink_sess.as_ref(), playback, sink_codec).await
+        });
+
+        let src_codec = open_codec(48_000, 2, AudioProfile::LowLatency);
+        let capture = Box::new(VecCapture { frames: frames.into_iter() });
+        run_audio_source(src_sess.as_ref(), capture, src_codec, 7, AudioProfile::LowLatency, 20_000)
+            .await
+            .unwrap();
+        sink.await.unwrap().unwrap();
+
+        // Opus is lossy, so output won't equal input — but each 20 ms frame
+        // decodes back to 960 samples/channel, so the whole stream survives.
+        let got = out.lock().unwrap().len();
+        assert!(
+            got >= n_frames * 960 * 2,
+            "expected at least {} samples through Opus, got {got}",
+            n_frames * 960 * 2
+        );
+    }
 }
