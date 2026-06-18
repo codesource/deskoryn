@@ -112,7 +112,10 @@ pub async fn clip_test(
         );
         return Ok(());
     }
-    println!("clipboard backend: real OS clipboard (arboard, text), polling every {} ms", config.clipboard.poll_ms);
+    println!(
+        "clipboard backend: real OS clipboard (arboard text/image + native file-list), polling every {} ms",
+        config.clipboard.poll_ms
+    );
 
     let poll = Duration::from_millis(config.clipboard.poll_ms);
     let (access, mut changes) = deskoryn_clipboard::platform::open_access(poll);
@@ -124,7 +127,7 @@ pub async fn clip_test(
         println!("current clipboard text: {cur:?}");
     }
 
-    println!("watching for changes for {secs}s (copy some text to see it detected)...");
+    println!("watching for changes for {secs}s (copy text / an image / files to see them detected)...");
     let deadline = tokio::time::sleep(Duration::from_secs(secs));
     tokio::pin!(deadline);
     let mut count = 0u64;
@@ -134,8 +137,23 @@ pub async fn clip_test(
             change = changes.recv() => {
                 let Some(change) = change else { break };
                 count += 1;
-                let text = access.read(ClipFormat::Utf8Text);
-                println!("  change seq={} formats={:?} text={:?}", change.seq, change.formats, text);
+                match change.formats.first() {
+                    Some(ClipFormat::FileList) => {
+                        let files = access.read_files();
+                        println!("  change seq={} formats={:?} files={:?}", change.seq, change.formats, files);
+                    }
+                    Some(ClipFormat::Png) => {
+                        let bytes = access.read(ClipFormat::Png).map(|p| match p {
+                            ClipPayload::Bytes(b) => b.len(),
+                            _ => 0,
+                        });
+                        println!("  change seq={} formats={:?} png_bytes={:?}", change.seq, change.formats, bytes);
+                    }
+                    _ => {
+                        let text = access.read(ClipFormat::Utf8Text);
+                        println!("  change seq={} formats={:?} text={:?}", change.seq, change.formats, text);
+                    }
+                }
             }
         }
     }

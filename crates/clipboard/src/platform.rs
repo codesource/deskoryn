@@ -239,6 +239,15 @@ pub mod system {
         h.finish()
     }
 
+    fn files_hash(paths: &[std::path::PathBuf]) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        2u8.hash(&mut h);
+        for p in paths {
+            p.hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// Encode arboard's RGBA8 image to PNG bytes for the wire.
     fn encode_png(img: &arboard::ImageData) -> Option<Vec<u8>> {
         use image::codecs::png::PngEncoder;
@@ -267,14 +276,22 @@ pub mod system {
     /// text). The hash drives change detection in [`watch`] without rendering or
     /// encoding anything — the bytes are produced lazily in [`SystemClipboard::read`].
     fn probe(cb: &StdMutex<arboard::Clipboard>) -> Option<(ClipFormat, u64)> {
-        let mut g = cb.lock().unwrap();
-        if let Ok(t) = g.get_text() {
-            if !t.is_empty() {
-                return Some((ClipFormat::Utf8Text, text_hash(&t)));
+        {
+            let mut g = cb.lock().unwrap();
+            if let Ok(t) = g.get_text() {
+                if !t.is_empty() {
+                    return Some((ClipFormat::Utf8Text, text_hash(&t)));
+                }
+            }
+            if let Ok(img) = g.get_image() {
+                return Some((ClipFormat::Png, image_hash(img.width, img.height, &img.bytes)));
             }
         }
-        if let Ok(img) = g.get_image() {
-            return Some((ClipFormat::Png, image_hash(img.width, img.height, &img.bytes)));
+        // A file copy (handled by the OS-native file-list backend, not arboard).
+        if let Some(paths) = crate::filelist::read() {
+            if !paths.is_empty() {
+                return Some((ClipFormat::FileList, files_hash(&paths)));
+            }
         }
         None
     }
@@ -294,6 +311,10 @@ pub mod system {
     pub struct SystemClipboard {
         cb: Arc<StdMutex<arboard::Clipboard>>,
         last_written: Arc<StdMutex<Option<u64>>>,
+        /// Holds the X11 file-selection owner (Linux) for as long as our file
+        /// list should stay on the clipboard; inert on Windows. Replacing it
+        /// drops the previous owner, relinquishing the old selection.
+        file_owner: Arc<StdMutex<Option<crate::filelist::OwnerGuard>>>,
     }
 
     impl ClipboardAccess for SystemClipboard {
@@ -310,11 +331,18 @@ pub mod system {
             }
         }
 
-        // TODO(impl): file-list read/write are the remaining OS-native gap —
-        // Windows `CF_HDROP`, X11/Wayland `text/uri-list`. arboard can't reach
-        // them, so `read_files`/`write_files` keep the trait's no-op defaults
-        // until those backends land; the daemon's file-paste handoff is wired
-        // and loopback-tested behind them.
+        fn read_files(&self) -> Option<Vec<std::path::PathBuf>> {
+            crate::filelist::read()
+        }
+
+        fn write_files(&self, paths: &[std::path::PathBuf]) {
+            // Remember the hash so the poller doesn't re-offer our own write as a
+            // fresh local file copy (echo). Then take selection ownership; the
+            // previous owner (if any) is dropped, relinquishing the old list.
+            *self.last_written.lock().unwrap() = Some(files_hash(paths));
+            let owner = crate::filelist::write(paths);
+            *self.file_owner.lock().unwrap() = owner;
+        }
 
         fn write(&self, payload: ClipPayload) {
             // Remember the content hash *before* setting it so the poller can't
@@ -349,7 +377,11 @@ pub mod system {
         let cb = arboard::Clipboard::new().map_err(|e| ClipboardError::Backend(e.to_string()))?;
         let cb = Arc::new(StdMutex::new(cb));
         let last_written = Arc::new(StdMutex::new(None::<u64>));
-        let access = Arc::new(SystemClipboard { cb: cb.clone(), last_written: last_written.clone() });
+        let access = Arc::new(SystemClipboard {
+            cb: cb.clone(),
+            last_written: last_written.clone(),
+            file_owner: Arc::new(StdMutex::new(None)),
+        });
         let (tx, rx) = mpsc::unbounded_channel();
 
         tokio::spawn(async move {

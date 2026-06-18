@@ -109,15 +109,21 @@ tuning/polish and the optional alt backends, not blockers.
   Decisions: eager fetch on copy (paste-time deferral needs the OS render
   callback), one transfer at a time over the shared channel. *Logic complete;
   pending the OS backend below + HW validation.*
-- ⬜ OS file-list backend — read/write the actual file clipboard: Windows
-  `CF_HDROP`, X11/Wayland `text/uri-list`. arboard can't reach these, so
-  `ClipboardAccess::read_files`/`write_files` keep no-op defaults until this
-  lands (the handoff above is wired and tested behind it). Native change events
-  to replace polling; Wayland `wlr-data-control`/portal + X11 `INCR` and the
-  `DataStream` path for very large (>16 MB) image transfers.
+- ✅ OS file-list backend (`clipboard::filelist`, behind `linux`/`windows`):
+  Windows `CF_HDROP` via the Win32 clipboard API; Linux X11 `text/uri-list` +
+  GNOME `x-special/gnome-copied-files` (read = one-shot selection query, write =
+  a background selection-owner thread). Coexists with arboard as last-writer-
+  wins (copy files → we own the selection; copy text → arboard takes it back via
+  `SelectionClear`). Polling detects file copies; echo-suppressed. URI
+  encode/parse unit-tested. `clip-test` prints detected file paths. *Code-
+  complete (compile-verified Linux + Windows-cross); pending HW validation.*
+- ⬜ Polish — Wayland file-list (`wlr-data-control`/portal; X11-only today),
+  native clipboard change events to replace polling, X11 `INCR` and the
+  `DataStream` path for very large (>16 MB) image transfers, and percent-encode
+  coverage for exotic paths.
 
 **Exit:** copy text/image on one machine, paste on the other, both directions.
-**Text path reached; image + file-paste logic complete, pending HW.**
+**Text HW-validated; image + full file copy-paste code-complete, pending HW.**
 
 ---
 

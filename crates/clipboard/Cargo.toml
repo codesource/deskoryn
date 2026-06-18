@@ -9,10 +9,11 @@ license.workspace = true
 [features]
 default = []
 # A real OS clipboard via `arboard` (cross-platform: X11/Wayland, Windows,
-# macOS). Both per-OS feature names map to it. `image` handles RGBA<->PNG for
-# the image format.
-linux-backend = ["dep:arboard", "dep:image"]
-windows-backend = ["dep:arboard", "dep:image"]
+# macOS) for text + images. `image` handles RGBA<->PNG. File lists (which
+# arboard can't reach) use OS-native backends: `x11rb` on Linux (X11
+# `text/uri-list` selection owner), the `windows` crate on Windows (`CF_HDROP`).
+linux-backend = ["dep:arboard", "dep:image", "dep:x11rb"]
+windows-backend = ["dep:arboard", "dep:image", "dep:windows"]
 
 [dependencies]
 deskoryn-core.workspace = true
@@ -23,3 +24,19 @@ tracing.workspace = true
 tokio.workspace = true
 arboard = { version = "3", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
+
+# Linux file-list backend: an X11 `text/uri-list` selection (read + owner).
+# Pure-Rust x11rb (already in the tree via arboard), target-gated so a Windows
+# build never pulls it in.
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", optional = true }
+
+# Windows file-list backend: `CF_HDROP` via the Win32 clipboard API.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Shell",
+] }

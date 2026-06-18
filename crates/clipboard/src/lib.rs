@@ -19,6 +19,9 @@
 //! A loop-suppression token (the originating device + sequence) prevents the
 //! classic A→B→A clipboard echo storm.
 
+/// OS-native file-list clipboard (`CF_HDROP` / X11 `text/uri-list`).
+#[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+pub mod filelist;
 pub mod platform;
 
 use async_trait::async_trait;
