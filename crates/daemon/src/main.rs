@@ -49,6 +49,12 @@ enum Cmd {
         /// input/clipboard/audio. Useful for development and CI.
         #[arg(long)]
         dry_run: bool,
+        /// Proactively dial these peers at startup (`host:port`), on top of
+        /// mDNS discovery and remembered peers. A plain `run` is the symmetric
+        /// "server/auto" role (listen + discover); passing `--connect` is the
+        /// "client" role that initiates to a known address. Repeatable.
+        #[arg(long = "connect", value_name = "HOST:PORT")]
+        connect: Vec<String>,
     },
     /// Print resolved config + paths and exit.
     Info,
@@ -118,8 +124,19 @@ async fn main() -> anyhow::Result<()> {
     let hostname = hostname();
     let config = Arc::new(AppConfig::load_or_bootstrap(&config_path, hostname)?);
 
-    match cli.cmd.unwrap_or(Cmd::Run { dry_run: false }) {
-        Cmd::Run { dry_run } => supervisor::run(config, paths, dry_run).await,
+    match cli.cmd.unwrap_or(Cmd::Run { dry_run: false, connect: Vec::new() }) {
+        Cmd::Run { dry_run, connect } => {
+            // "client" role: seed the dial loop with the given addresses on top
+            // of the configured static peers. Plain `run` stays symmetric.
+            let config = if connect.is_empty() {
+                config
+            } else {
+                let mut c = (*config).clone();
+                c.network.static_peers.extend(connect);
+                Arc::new(c)
+            };
+            supervisor::run(config, paths, dry_run).await
+        }
         Cmd::Info => {
             println!("device:     {} ({})", config.device.name, config.device.id);
             println!("config:     {}", config_path.display());
