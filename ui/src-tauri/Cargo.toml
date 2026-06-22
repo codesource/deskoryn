@@ -1,0 +1,37 @@
+# Standalone manifest: this crate is its own workspace root so the portable
+# `deskoryn` workspace never pulls in Tauri / webkit2gtk / WebView2.
+[workspace]
+
+[package]
+name = "deskoryn-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Deskoryn tray UI — a thin Tauri client for the deskorynd daemon"
+publish = false
+
+# This crate is intentionally OUTSIDE the workspace `cargo build`: it pulls in
+# Tauri + webkit2gtk (Linux) / WebView2 (Windows), which the portable Rust
+# workspace must not require. Build it from `ui/` with the Tauri CLI.
+
+[lib]
+name = "deskoryn_ui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "deskoryn-ui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "process"] }
+directories = "5"
+
+[features]
+# this feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]

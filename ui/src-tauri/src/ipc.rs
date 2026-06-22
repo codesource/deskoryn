@@ -1,0 +1,162 @@
+//! Thin client for `deskorynd`'s local control socket.
+//!
+//! The daemon defines the canonical protocol in `crates/daemon/src/ipc.rs`
+//! (`UiRequest` / `UiEvent`, length-prefixed JSON over a Unix domain socket on
+//! Linux / a named pipe on Windows). This file mirrors that vocabulary so the
+//! tray UI can drive a headless daemon without depending on the daemon binary
+//! crate. **Keep the field names and `serde` tags in lockstep with the daemon.**
+
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Commands the UI sends to the daemon. Mirrors `daemon::ipc::UiRequest`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum UiRequest {
+    Status,
+    Pair { addr: String },
+    PairConfirm { accept: bool },
+    Forget { device: String },
+    SetLayout { layout: serde_json::Value },
+    SetFeature { feature: Feature, enabled: bool },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Feature {
+    ClipboardSync,
+    AudioForward,
+    InputSharing,
+}
+
+/// Events/responses the daemon sends to the UI. Mirrors `daemon::ipc::UiEvent`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum UiEvent {
+    Status {
+        device_name: String,
+        peers: Vec<PeerStatus>,
+        active: bool,
+    },
+    PairingPrompt {
+        device_name: String,
+        sas: String,
+    },
+    TransferProgress {
+        tag: u64,
+        name: String,
+        fraction: f32,
+        bytes_per_sec: u64,
+    },
+    Notice {
+        level: NoticeLevel,
+        text: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoticeLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub name: String,
+    pub connected: bool,
+    pub address: Option<String>,
+    pub latency_ms: Option<u32>,
+}
+
+/// Resolve the daemon's control-socket path. Mirrors
+/// `deskoryn_core::config::Paths::socket_file` (`<state_dir>/deskorynd.sock`).
+///
+/// The state dir follows the platform data-dir convention used by the daemon
+/// (`directories::ProjectDirs`), with a `DESKORYN_STATE_DIR` override for
+/// non-standard installs.
+pub fn socket_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("DESKORYN_STATE_DIR") {
+        return PathBuf::from(dir).join("deskorynd.sock");
+    }
+    let state_dir = directories::ProjectDirs::from("ch", "biceps", "deskoryn")
+        .map(|p| p.data_dir().to_path_buf())
+        .unwrap_or_else(|| std::env::temp_dir().join("deskoryn"));
+    state_dir.join("deskorynd.sock")
+}
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+async fn write_msg<T: Serialize, W: AsyncWriteExt + Unpin>(w: &mut W, msg: &T) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(msg)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    w.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+    w.write_all(&bytes).await?;
+    w.flush().await
+}
+
+async fn read_msg<T: serde::de::DeserializeOwned, R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> std::io::Result<Option<T>> {
+    let mut len = [0u8; 4];
+    match r.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let n = u32::from_le_bytes(len) as usize;
+    // Guard against a bogus length from a misbehaving/foreign peer on the socket.
+    if n > 16 * 1024 * 1024 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "control-socket frame too large",
+        ));
+    }
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).await?;
+    let msg = serde_json::from_slice(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    Ok(Some(msg))
+}
+
+/// Send one request to the daemon and collect every event it streams back.
+///
+/// One connection = one request = its response events, matching the daemon's
+/// `ipc::serve` model. Platform transport: Unix domain socket on Unix, named
+/// pipe on Windows.
+pub async fn request(req: &UiRequest) -> std::io::Result<Vec<UiEvent>> {
+    let path = socket_path();
+
+    #[cfg(unix)]
+    {
+        use tokio::net::UnixStream;
+        let mut stream = UnixStream::connect(&path).await?;
+        write_msg(&mut stream, req).await?;
+        let mut out = Vec::new();
+        while let Some(ev) = read_msg::<UiEvent, _>(&mut stream).await? {
+            out.push(ev);
+        }
+        Ok(out)
+    }
+
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        // The daemon's named-pipe name derives from the same socket path's file
+        // stem; keep this in lockstep with the daemon's Windows transport.
+        let name = format!(
+            r"\\.\pipe\{}",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("deskorynd.sock")
+        );
+        let mut client = ClientOptions::new().open(&name)?;
+        write_msg(&mut client, req).await?;
+        let mut out = Vec::new();
+        while let Some(ev) = read_msg::<UiEvent, _>(&mut client).await? {
+            out.push(ev);
+        }
+        Ok(out)
+    }
+}

@@ -17,6 +17,9 @@ members = [
     "crates/audio",
     "crates/daemon",
 ]
+# The Tauri tray UI (ui/src-tauri) is its own workspace root — it depends on
+# webkit2gtk/WebView2 and must stay out of the portable default build.
+exclude = ["ui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
