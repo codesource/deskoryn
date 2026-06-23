@@ -6,10 +6,8 @@
 /run
 *.log
 
-# Tauri / node UI build artifacts
-/ui/node_modules
-/ui/dist
-/ui/src-tauri/target
+# iced UI build artifacts
+/ui/target
 
 # Fuzzing (cargo-fuzz) artifacts
 /fuzz/target
