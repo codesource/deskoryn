@@ -8,6 +8,7 @@
 //! ([`daemon`]). Status is polled on a timer (the control channel is
 //! request/response, no push).
 
+mod arranger;
 mod daemon;
 mod ipc;
 
@@ -15,9 +16,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use daemon::{BinInfo, Lifecycle, PairState, ProcMgr};
+use arranger::MonTile;
 use iced::widget::{
     button, checkbox, column, container, horizontal_rule, row, scrollable, text, text_input,
-    Space,
+    Canvas, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
 use ipc::{Feature, PeerStatus, UiEvent, UiRequest};
@@ -69,6 +71,9 @@ struct App {
     pairing: PairState,
     pair_listen: bool,
     pair_addr: String,
+
+    // Monitor arranger
+    arrangement: Vec<MonTile>,
 }
 
 #[derive(Clone, Debug)]
@@ -98,6 +103,11 @@ enum Message {
     PairStateLoaded(PairState),
     PairRespond(bool),
     PairClear,
+    // Monitor arranger
+    ArrMoved { idx: usize, x: i32, y: i32 },
+    ArrAlignTops,
+    ArrRevert,
+    ArrApply,
 }
 
 impl App {
@@ -121,6 +131,7 @@ impl App {
             pairing: PairState::Idle,
             pair_listen: true,
             pair_addr: String::new(),
+            arrangement: arranger::starter(),
         };
         let proc = app.proc.clone();
         // Load the persisted binary override, then do a first refresh.
@@ -309,6 +320,28 @@ impl App {
                     Task::perform(ipc::request(UiRequest::Status), Message::StatusLoaded),
                 ])
             }
+            Message::ArrMoved { idx, x, y } => {
+                if let Some(t) = self.arrangement.get_mut(idx) {
+                    t.x = x;
+                    t.y = y;
+                }
+                Task::none()
+            }
+            Message::ArrAlignTops => {
+                let top = self.arrangement.iter().map(|t| t.y).min().unwrap_or(0);
+                for t in &mut self.arrangement {
+                    t.y = top;
+                }
+                Task::none()
+            }
+            Message::ArrRevert => {
+                self.arrangement = arranger::starter();
+                Task::none()
+            }
+            Message::ArrApply => {
+                let layout = arranger::to_virtual_desktop(&self.arrangement);
+                Task::perform(ipc::request(UiRequest::SetLayout { layout }), Message::Acted)
+            }
         }
     }
 
@@ -475,10 +508,39 @@ impl App {
     }
 
     fn view_arranger(&self) -> Element<'_, Message> {
+        let canvas = Canvas::new(arranger::Arranger { tiles: &self.arrangement })
+            .width(Length::Fill)
+            .height(Length::Fixed(320.0));
+
+        // Virtual-desktop extent, for the readout.
+        let (l, t, r, b) = self.arrangement.iter().fold(
+            (i32::MAX, i32::MAX, i32::MIN, i32::MIN),
+            |(l, t, r, b), m| (l.min(m.x), t.min(m.y), r.max(m.x + m.w), b.max(m.y + m.h)),
+        );
+        let extent = if self.arrangement.is_empty() {
+            "—".to_string()
+        } else {
+            format!("{} displays · {} × {} virtual", self.arrangement.len(), r - l, b - t)
+        };
+
         column![
             text("Arrange monitors").size(18),
-            text("The draggable monitor canvas is the next piece of the iced port.").size(13),
-            text("Until then, edit the layout via `deskorynd arrange` on the CLI.").size(12),
+            text("Drag a display to match your physical desk; touching edges become cursor-crossing boundaries.").size(12),
+            container(canvas)
+                .width(Length::Fill)
+                .style(|_: &Theme| container::Style {
+                    border: iced::Border { width: 1.0, color: iced::Color::from_rgb8(0xd0, 0xd5, 0xdc), radius: 6.0.into() },
+                    ..container::Style::default()
+                }),
+            text(extent).size(12),
+            row![
+                button("Auto-align tops").on_press(Message::ArrAlignTops),
+                button("Revert").on_press(Message::ArrRevert),
+                Space::with_width(Length::Fill),
+                button("Apply").on_press(Message::ArrApply).style(button::primary),
+            ]
+            .spacing(8),
+            text("Apply pushes SetLayout; the daemon-side handler for it is still a stub (see roadmap).").size(11),
         ]
         .spacing(10)
         .into()
