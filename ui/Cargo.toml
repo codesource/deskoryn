@@ -1,0 +1,23 @@
+# Standalone manifest: the iced tray UI is its own workspace root so its GUI
+# dependencies (iced, winit, wgpu) stay out of the portable `deskoryn` workspace.
+# Pure-Rust, self-contained binary — no system webview (WebView2/webkit) or node.
+[workspace]
+
+[package]
+name = "deskoryn-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Deskoryn tray UI — a self-contained iced client for the deskorynd daemon"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "deskoryn-ui"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "process", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+directories = "5"

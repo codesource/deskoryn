@@ -1,15 +1,12 @@
-//! Thin client for `deskorynd`'s local control socket.
+//! Thin client for `deskorynd`'s local control channel.
 //!
-//! The daemon defines the canonical protocol in `crates/daemon/src/ipc.rs`
-//! (`UiRequest` / `UiEvent`, length-prefixed JSON over a Unix domain socket on
-//! Linux / a named pipe on Windows). This file mirrors that vocabulary so the
-//! tray UI can drive a headless daemon without depending on the daemon binary
-//! crate. **Keep the field names and `serde` tags in lockstep with the daemon.**
+//! Mirrors the daemon's protocol (`crates/daemon/src/ipc.rs`): length-prefixed
+//! JSON over a Unix domain socket (Unix/macOS) or a named pipe (Windows). Keep
+//! the field names and `serde` tags in lockstep with the daemon.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Commands the UI sends to the daemon. Mirrors `daemon::ipc::UiRequest`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum UiRequest {
@@ -29,7 +26,6 @@ pub enum Feature {
     InputSharing,
 }
 
-/// Events/responses the daemon sends to the UI. Mirrors `daemon::ipc::UiEvent`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum UiEvent {
@@ -70,20 +66,17 @@ pub struct PeerStatus {
     pub latency_ms: Option<u32>,
 }
 
-/// Resolve the daemon's control-socket path. Mirrors
-/// `deskoryn_core::config::Paths::socket_file` (`<state_dir>/deskorynd.sock`).
-///
-/// The state dir follows the platform data-dir convention used by the daemon
-/// (`directories::ProjectDirs`), with a `DESKORYN_STATE_DIR` override for
-/// non-standard installs.
+/// Resolve the daemon's control-socket path (mirrors
+/// `deskoryn_core::config::Paths::socket_file` — `<state_dir>/deskorynd.sock`),
+/// with a `DESKORYN_STATE_DIR` override.
 pub fn socket_path() -> PathBuf {
     if let Ok(dir) = std::env::var("DESKORYN_STATE_DIR") {
         return PathBuf::from(dir).join("deskorynd.sock");
     }
-    let state_dir = directories::ProjectDirs::from("ch", "biceps", "deskoryn")
+    directories::ProjectDirs::from("ch", "biceps", "deskoryn")
         .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("deskoryn"));
-    state_dir.join("deskorynd.sock")
+        .unwrap_or_else(|| std::env::temp_dir().join("deskoryn"))
+        .join("deskorynd.sock")
 }
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -106,11 +99,10 @@ async fn read_msg<T: serde::de::DeserializeOwned, R: AsyncReadExt + Unpin>(
         Err(e) => return Err(e),
     }
     let n = u32::from_le_bytes(len) as usize;
-    // Guard against a bogus length from a misbehaving/foreign peer on the socket.
     if n > 16 * 1024 * 1024 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "control-socket frame too large",
+            "control-channel frame too large",
         ));
     }
     let mut buf = vec![0u8; n];
@@ -120,21 +112,20 @@ async fn read_msg<T: serde::de::DeserializeOwned, R: AsyncReadExt + Unpin>(
     Ok(Some(msg))
 }
 
-/// Send one request to the daemon and collect every event it streams back.
-///
-/// One connection = one request = its response events, matching the daemon's
-/// `ipc::serve` model. Platform transport: Unix domain socket on Unix, named
-/// pipe on Windows.
-pub async fn request(req: &UiRequest) -> std::io::Result<Vec<UiEvent>> {
+/// Send one request and collect the daemon's response events. Returns a
+/// human-readable error string (so it can ride an iced `Message`, which is `Clone`).
+pub async fn request(req: UiRequest) -> Result<Vec<UiEvent>, String> {
     let path = socket_path();
 
     #[cfg(unix)]
     {
         use tokio::net::UnixStream;
-        let mut stream = UnixStream::connect(&path).await?;
-        write_msg(&mut stream, req).await?;
+        let mut stream = UnixStream::connect(&path)
+            .await
+            .map_err(|e| format!("daemon not reachable ({e})"))?;
+        write_msg(&mut stream, &req).await.map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        while let Some(ev) = read_msg::<UiEvent, _>(&mut stream).await? {
+        while let Some(ev) = read_msg::<UiEvent, _>(&mut stream).await.map_err(|e| e.to_string())? {
             out.push(ev);
         }
         Ok(out)
@@ -143,18 +134,16 @@ pub async fn request(req: &UiRequest) -> std::io::Result<Vec<UiEvent>> {
     #[cfg(windows)]
     {
         use tokio::net::windows::named_pipe::ClientOptions;
-        // The daemon's named-pipe name derives from the same socket path's file
-        // stem; keep this in lockstep with the daemon's Windows transport.
         let name = format!(
             r"\\.\pipe\{}",
-            path.file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("deskorynd.sock")
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("deskorynd.sock")
         );
-        let mut client = ClientOptions::new().open(&name)?;
-        write_msg(&mut client, req).await?;
+        let mut client = ClientOptions::new()
+            .open(&name)
+            .map_err(|e| format!("daemon not reachable ({e})"))?;
+        write_msg(&mut client, &req).await.map_err(|e| e.to_string())?;
         let mut out = Vec::new();
-        while let Some(ev) = read_msg::<UiEvent, _>(&mut client).await? {
+        while let Some(ev) = read_msg::<UiEvent, _>(&mut client).await.map_err(|e| e.to_string())? {
             out.push(ev);
         }
         Ok(out)
