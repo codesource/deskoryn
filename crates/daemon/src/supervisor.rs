@@ -61,23 +61,60 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     // socket on Unix/macOS, named pipe on Windows).
     #[cfg(any(unix, windows))]
     {
-        use crate::ipc::{self, PeerStatus, UiEvent, UiRequest};
+        use crate::ipc::{self, HandlerFuture, PeerStatus, UiEvent, UiRequest};
         let device_name = config.device.name.clone();
-        let peer_names: Vec<String> = trust.lock().await.devices.iter().map(|d| d.name.clone()).collect();
         let listen_port = endpoint.local_port();
         let socket = paths.socket_file();
-        let handler: ipc::Handler = std::sync::Arc::new(move |req| match req {
-            UiRequest::Status => vec![UiEvent::Status {
-                device_name: device_name.clone(),
-                // TODO(impl): report live connection state from the session tasks.
-                peers: peer_names
-                    .iter()
-                    .map(|n| PeerStatus { name: n.clone(), connected: false, address: None, latency_ms: None })
-                    .collect(),
-                active: false,
-                port: listen_port,
-            }],
-            _ => vec![],
+        let trust_for_ipc = trust.clone();
+        let trust_file = paths.trust_file();
+
+        // Build a fresh Status snapshot from the (live) trust store.
+        async fn status(
+            trust: &tokio::sync::Mutex<deskoryn_core::trust::TrustStore>,
+            device_name: String,
+            port: u16,
+        ) -> Vec<UiEvent> {
+            let t = trust.lock().await;
+            // TODO(impl): report live connection state from the session tasks.
+            let peers = t
+                .devices
+                .iter()
+                .map(|d| PeerStatus {
+                    name: d.name.clone(),
+                    connected: false,
+                    address: d.last_address.clone(),
+                    latency_ms: None,
+                })
+                .collect();
+            vec![UiEvent::Status { device_name, peers, active: false, port }]
+        }
+
+        let handler: ipc::Handler = std::sync::Arc::new(move |req| {
+            let trust = trust_for_ipc.clone();
+            let device_name = device_name.clone();
+            let trust_file = trust_file.clone();
+            Box::pin(async move {
+                match req {
+                    UiRequest::Status => status(&trust, device_name, listen_port).await,
+                    UiRequest::Forget { device } => {
+                        {
+                            let mut t = trust.lock().await;
+                            // The UI sends the device's name; map it to its id.
+                            if let Some(id) = t.devices.iter().find(|d| d.name == device).map(|d| d.id) {
+                                if t.forget(id) {
+                                    if let Err(e) = t.save(&trust_file) {
+                                        tracing::warn!(error = %e, "failed to save trust store after forget");
+                                    }
+                                    tracing::info!(%device, "forgot trusted device");
+                                }
+                            }
+                        }
+                        // Return a fresh snapshot so the UI updates immediately.
+                        status(&trust, device_name, listen_port).await
+                    }
+                    _ => vec![],
+                }
+            }) as HandlerFuture
         });
         tracing::info!(socket = %socket.display(), "control socket listening");
         let socket_for_serve = socket.clone();

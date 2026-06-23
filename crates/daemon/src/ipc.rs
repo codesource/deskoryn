@@ -100,8 +100,11 @@ fn pipe_name(path: &Path) -> String {
     )
 }
 
-/// A request handler: maps one [`UiRequest`] to the events to send back.
-pub type Handler = std::sync::Arc<dyn Fn(UiRequest) -> Vec<UiEvent> + Send + Sync>;
+/// A request handler: maps one [`UiRequest`] to the events to send back. Async
+/// so handlers can touch the trust store / config (e.g. `Forget`) and report
+/// live state, not just a startup snapshot.
+pub type HandlerFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Vec<UiEvent>> + Send>>;
+pub type Handler = std::sync::Arc<dyn Fn(UiRequest) -> HandlerFuture + Send + Sync>;
 
 async fn write_msg<T: Serialize, W: AsyncWriteExt + Unpin>(w: &mut W, msg: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(msg).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -145,7 +148,7 @@ pub async fn serve(path: PathBuf, handler: Handler) -> std::io::Result<()> {
         let handler = handler.clone();
         tokio::spawn(async move {
             if let Ok(Some(req)) = read_msg::<UiRequest, _>(&mut stream).await {
-                for ev in handler(req) {
+                for ev in handler(req).await {
                     if write_msg(&mut stream, &ev).await.is_err() {
                         break;
                     }
@@ -187,7 +190,7 @@ pub async fn serve(path: PathBuf, handler: Handler) -> std::io::Result<()> {
         let handler = handler.clone();
         tokio::spawn(async move {
             if let Ok(Some(req)) = read_msg::<UiRequest, _>(&mut connected).await {
-                for ev in handler(req) {
+                for ev in handler(req).await {
                     if write_msg(&mut connected, &ev).await.is_err() {
                         break;
                     }
@@ -220,14 +223,18 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("d.sock");
 
-        let handler: Handler = std::sync::Arc::new(|req| match req {
-            UiRequest::Status => vec![UiEvent::Status {
-                device_name: "test-device".into(),
-                peers: vec![PeerStatus { name: "peer".into(), connected: true, address: None, latency_ms: Some(7) }],
-                active: true,
-                port: 7345,
-            }],
-            _ => vec![],
+        let handler: Handler = std::sync::Arc::new(|req| {
+            Box::pin(async move {
+                match req {
+                    UiRequest::Status => vec![UiEvent::Status {
+                        device_name: "test-device".into(),
+                        peers: vec![PeerStatus { name: "peer".into(), connected: true, address: None, latency_ms: Some(7) }],
+                        active: true,
+                        port: 7345,
+                    }],
+                    _ => vec![],
+                }
+            }) as HandlerFuture
         });
         let server = tokio::spawn(serve(sock.clone(), handler));
 
