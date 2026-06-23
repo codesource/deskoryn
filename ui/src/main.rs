@@ -153,6 +153,7 @@ impl App {
             Message::StatusLoaded(Err(_)) => {
                 self.reachable = false;
                 self.peers.clear();
+                self.port = 0; // don't show a port we can't currently confirm
                 Task::none()
             }
             Message::LifecycleLoaded(l) => {
@@ -184,9 +185,13 @@ impl App {
             Message::StartDaemon => {
                 let connect = (!self.manual_peer.trim().is_empty()).then(|| self.manual_peer.clone());
                 let port = self.port_input.parse::<u16>().ok().filter(|p| *p != 0);
+                // Clear the previous daemon's port so we don't flash a stale value
+                // before the new daemon reports its actual one.
+                self.port = 0;
                 Task::perform(self.proc.clone().start(connect, port), Message::DaemonActed)
             }
             Message::StopDaemon => {
+                self.port = 0;
                 Task::perform(self.proc.clone().stop(), Message::DaemonActed)
             }
             Message::DaemonActed(r) => {
