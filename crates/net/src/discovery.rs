@@ -159,7 +159,7 @@ pub mod mdns {
             .to_string();
         let fingerprint = info.get_property_val_str("fp").and_then(parse_fp);
         let pairing = info.get_property_val_str("pair").map(|s| s == "1").unwrap_or(false);
-        let ip = info.get_addresses().iter().next().copied()?;
+        let ip = pick_address(info.get_addresses())?;
         Some(PeerHint {
             device,
             name,
@@ -167,6 +167,23 @@ pub mod mdns {
             fingerprint,
             pairing,
         })
+    }
+
+    /// Choose a dialable address from a peer's advertised set: prefer IPv4, then
+    /// a non-link-local IPv6. `fe80::/10` link-local needs a scope/zone id that
+    /// quinn rejects ("invalid remote address"), so skip it.
+    fn pick_address<'a>(addrs: impl IntoIterator<Item = &'a std::net::IpAddr>) -> Option<std::net::IpAddr> {
+        let addrs: Vec<std::net::IpAddr> = addrs.into_iter().copied().collect();
+        addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| {
+                addrs.iter().find(|a| match a {
+                    std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+                    std::net::IpAddr::V4(_) => false,
+                })
+            })
+            .copied()
     }
 
     fn parse_fp(s: &str) -> Option<CertFingerprint> {
