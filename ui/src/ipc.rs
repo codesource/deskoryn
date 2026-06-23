@@ -11,8 +11,11 @@ use std::path::PathBuf;
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum UiRequest {
     Status,
+    /// Empty `addr` = make discoverable (wait); non-empty = dial that peer.
     Pair { addr: String },
     PairConfirm { accept: bool },
+    PairStatus,
+    PairCancel,
     Forget { device: String },
     SetLayout { layout: serde_json::Value },
     SetFeature { feature: Feature, enabled: bool },
@@ -36,9 +39,10 @@ pub enum UiEvent {
         #[serde(default)]
         port: u16,
     },
-    PairingPrompt {
-        device_name: String,
+    Pairing {
+        phase: String,
         sas: String,
+        peer: String,
     },
     TransferProgress {
         tag: u64,

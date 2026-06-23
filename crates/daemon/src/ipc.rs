@@ -18,10 +18,16 @@ use serde::{Deserialize, Serialize};
 pub enum UiRequest {
     /// Current status snapshot (peers, active role, transfer list).
     Status,
-    /// Begin pairing with a manually entered address.
+    /// Start pairing. Empty `addr` opens the *discoverable* window (wait for a
+    /// peer); a non-empty `addr` dials that peer to pair. Runs on the live
+    /// daemon endpoint — no need to stop the daemon.
     Pair { addr: String },
     /// Confirm/deny the SAS comparison for an in-progress pairing.
     PairConfirm { accept: bool },
+    /// Poll the current pairing flow (the channel is request/response).
+    PairStatus,
+    /// Cancel pairing / close the discoverable window / dismiss the result.
+    PairCancel,
     /// Forget a trusted device.
     Forget { device: String },
     /// Push an edited virtual-desktop layout.
@@ -50,8 +56,9 @@ pub enum UiEvent {
         #[serde(default)]
         port: u16,
     },
-    /// A pairing needs the user to compare codes.
-    PairingPrompt { device_name: String, sas: String },
+    /// Current pairing flow. `phase` ∈ idle | discoverable | connecting |
+    /// prompt | paired | aborted | error; `sas`/`peer` set during prompt/result.
+    Pairing { phase: String, sas: String, peer: String },
     /// File-transfer progress for the tray's progress UI.
     TransferProgress {
         tag: u64,

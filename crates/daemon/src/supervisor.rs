@@ -57,6 +57,10 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     let endpoint = Arc::new(QuicEndpoint::bind(config.network.listen_port, identity, trust.clone()).await?);
     tracing::info!(port = endpoint.local_port(), "QUIC endpoint bound");
 
+    // Pairing coordinator: shared by the IPC handler (open window / dial /
+    // confirm) and the accept loop (route an untrusted peer into pairing).
+    let pairing = Arc::new(crate::pairing::Pairing::default());
+
     // Local control channel for the tray UI / `deskorynd status` (Unix domain
     // socket on Unix/macOS, named pipe on Windows).
     #[cfg(any(unix, windows))]
@@ -67,6 +71,26 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let socket = paths.socket_file();
         let trust_for_ipc = trust.clone();
         let trust_file = paths.trust_file();
+        let pairing_ipc = pairing.clone();
+        let endpoint_ipc = endpoint.clone();
+        let config_ipc = config.clone();
+        let paths_ipc = paths.clone();
+        let local_fp_ipc = identity_fp;
+
+        // Map a pairing snapshot to the wire event.
+        fn pairing_event(s: crate::pairing::PairState) -> UiEvent {
+            use crate::pairing::PairState::*;
+            let (phase, sas, peer) = match s {
+                Idle => ("idle", String::new(), String::new()),
+                Discoverable => ("discoverable", String::new(), String::new()),
+                Connecting => ("connecting", String::new(), String::new()),
+                Prompt { sas, peer } => ("prompt", sas, peer),
+                Done { ok: true, peer } => ("paired", String::new(), peer),
+                Done { ok: false, peer } => ("aborted", String::new(), peer),
+                Error(e) => ("error", String::new(), e),
+            };
+            UiEvent::Pairing { phase: phase.into(), sas, peer }
+        }
 
         // Build a fresh Status snapshot from the (live) trust store.
         async fn status(
@@ -93,9 +117,56 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             let trust = trust_for_ipc.clone();
             let device_name = device_name.clone();
             let trust_file = trust_file.clone();
+            let pairing = pairing_ipc.clone();
+            let endpoint = endpoint_ipc.clone();
+            let config = config_ipc.clone();
+            let paths = paths_ipc.clone();
             Box::pin(async move {
                 match req {
                     UiRequest::Status => status(&trust, device_name, listen_port).await,
+                    UiRequest::PairStatus => vec![pairing_event(pairing.snapshot().await)],
+                    UiRequest::PairConfirm { accept } => {
+                        pairing.respond(accept).await;
+                        vec![pairing_event(pairing.snapshot().await)]
+                    }
+                    UiRequest::PairCancel => {
+                        pairing.clear().await;
+                        vec![pairing_event(pairing.snapshot().await)]
+                    }
+                    UiRequest::Pair { addr } => {
+                        if addr.trim().is_empty() {
+                            // Open the discoverable window; the accept loop will
+                            // route the next untrusted peer into pairing.
+                            pairing.set_discoverable(true).await;
+                        } else {
+                            // Dial the chosen peer and pair, on the live endpoint.
+                            let addr = addr.trim().to_string();
+                            match addr.parse() {
+                                Ok(sock) => {
+                                    let pairing2 = pairing.clone();
+                                    let config2 = config.clone();
+                                    let trust2 = trust.clone();
+                                    let paths2 = paths.clone();
+                                    let endpoint2 = endpoint.clone();
+                                    tokio::spawn(async move {
+                                        match endpoint2.connect_unverified(sock).await {
+                                            Ok(session) => {
+                                                let _ = crate::pairing::run_handshake(
+                                                    pairing2, session, true, Some(addr),
+                                                    config2, local_fp_ipc, trust2, paths2,
+                                                ).await;
+                                            }
+                                            Err(e) => {
+                                                pairing2.fail(format!("connect failed: {e}")).await;
+                                            }
+                                        }
+                                    });
+                                }
+                                Err(e) => pairing.fail(format!("bad address: {e}")).await,
+                            }
+                        }
+                        vec![pairing_event(pairing.snapshot().await)]
+                    }
                     UiRequest::Forget { device } => {
                         {
                             let mut t = trust.lock().await;
@@ -132,14 +203,19 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         }
     }
 
-    // Accept loop: every inbound, authenticated session gets its own task.
+    // Accept loop: a trusted peer gets a session; an untrusted peer is paired
+    // (only while a discoverable window is open), else dropped.
     {
         let endpoint = endpoint.clone();
         let config = config.clone();
+        let pairing = pairing.clone();
+        let trust_accept = trust.clone();
+        let paths_accept = paths.clone();
         tokio::spawn(async move {
+            use deskoryn_net::quic::Accepted;
             loop {
-                match endpoint.accept().await {
-                    Ok(session) => {
+                match endpoint.accept_any().await {
+                    Ok(Accepted::Trusted(session)) => {
                         let config = config.clone();
                         tokio::spawn(async move {
                             if let Err(e) = crate::session::run(config, session).await {
@@ -147,8 +223,27 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                             }
                         });
                     }
+                    Ok(Accepted::Unknown(session)) => {
+                        if pairing.is_discoverable() {
+                            let pairing = pairing.clone();
+                            let config = config.clone();
+                            let trust = trust_accept.clone();
+                            let paths = paths_accept.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = crate::pairing::run_handshake(
+                                    pairing, session, false, None, config, identity_fp, trust, paths,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(error = %e, "pairing handshake failed");
+                                }
+                            });
+                        } else {
+                            tracing::debug!("dropped untrusted peer (not in pairing mode)");
+                        }
+                    }
                     Err(e) => {
-                        tracing::debug!(error = %e, "accept rejected/failed");
+                        tracing::debug!(error = %e, "accept failed");
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
                 }

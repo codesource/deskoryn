@@ -15,7 +15,7 @@ mod ipc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon::{BinInfo, Lifecycle, PairState, ProcMgr};
+use daemon::{BinInfo, Lifecycle, ProcMgr};
 use arranger::MonTile;
 use iced::widget::{
     button, checkbox, column, container, horizontal_rule, row, scrollable, text, text_input,
@@ -67,8 +67,10 @@ struct App {
     features: Features,
     toast: Option<String>,
 
-    // Pairing
-    pairing: PairState,
+    // Pairing (driven by the daemon over IPC; we poll PairStatus)
+    pair_phase: String, // idle | discoverable | connecting | prompt | paired | aborted | error
+    pair_sas: String,
+    pair_peer: String,
     pair_listen: bool,
     pair_addr: String,
 
@@ -98,9 +100,8 @@ enum Message {
     PairRoleListen(bool),
     PairAddrChanged(String),
     PairStart,
-    PairStarted(Result<(), String>),
     PairPoll,
-    PairStateLoaded(PairState),
+    PairLoaded(Result<Vec<UiEvent>, String>),
     PairRespond(bool),
     PairClear,
     // Monitor arranger
@@ -128,7 +129,9 @@ impl App {
             bin_input: String::new(),
             features: Features { input: true, clipboard: true, audio: false },
             toast: None,
-            pairing: PairState::Idle,
+            pair_phase: "idle".into(),
+            pair_sas: String::new(),
+            pair_peer: String::new(),
             pair_listen: true,
             pair_addr: String::new(),
             arrangement: arranger::starter(),
@@ -151,7 +154,7 @@ impl App {
         let status = iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick);
         // While a pairing is live, poll its state quickly so the SAS code and
         // outcome show promptly.
-        if self.pairing != PairState::Idle {
+        if self.pair_phase != "idle" {
             Subscription::batch([
                 status,
                 iced::time::every(Duration::from_millis(300)).map(|_| Message::PairPoll),
@@ -183,7 +186,7 @@ impl App {
                             self.transfers.push((name.clone(), *fraction, *bytes_per_sec));
                         }
                         UiEvent::Notice { text, .. } => self.toast = Some(text.clone()),
-                        UiEvent::PairingPrompt { .. } => {}
+                        UiEvent::Pairing { .. } => {}
                     }
                 }
                 Task::none()
@@ -290,33 +293,37 @@ impl App {
                 Task::none()
             }
             Message::PairStart => {
-                let listen = self.pair_listen;
-                let addr = (!listen).then(|| self.pair_addr.clone());
-                Task::perform(self.proc.clone().pair_start(listen, addr), Message::PairStarted)
+                // Empty addr = make discoverable (wait); else dial that peer.
+                let addr = if self.pair_listen { String::new() } else { self.pair_addr.clone() };
+                Task::perform(ipc::request(UiRequest::Pair { addr }), Message::PairLoaded)
             }
-            Message::PairStarted(Ok(())) => {
-                Task::perform(self.proc.clone().pair_state(), Message::PairStateLoaded)
+            Message::PairPoll => {
+                Task::perform(ipc::request(UiRequest::PairStatus), Message::PairLoaded)
             }
-            Message::PairStarted(Err(e)) => {
+            Message::PairLoaded(Ok(events)) => {
+                if let Some(UiEvent::Pairing { phase, sas, peer }) =
+                    events.into_iter().find(|e| matches!(e, UiEvent::Pairing { .. }))
+                {
+                    self.pair_phase = phase;
+                    self.pair_sas = sas;
+                    self.pair_peer = peer;
+                }
+                Task::none()
+            }
+            Message::PairLoaded(Err(e)) => {
                 self.toast = Some(e);
                 Task::none()
             }
-            Message::PairPoll => {
-                Task::perform(self.proc.clone().pair_state(), Message::PairStateLoaded)
-            }
-            Message::PairStateLoaded(s) => {
-                self.pairing = s;
-                Task::none()
-            }
-            Message::PairRespond(accept) => {
-                Task::perform(self.proc.clone().pair_respond(accept), |_| Message::PairPoll)
-            }
+            Message::PairRespond(accept) => Task::perform(
+                ipc::request(UiRequest::PairConfirm { accept }),
+                Message::PairLoaded,
+            ),
             Message::PairClear => {
-                self.pairing = PairState::Idle;
-                // Clear the subprocess, then refresh the device list (a new
-                // device may have just landed in the trust store).
+                self.pair_phase = "idle".into();
+                self.pair_sas.clear();
+                self.pair_peer.clear();
                 Task::batch([
-                    Task::perform(self.proc.clone().pair_clear(), |_| Message::PairPoll),
+                    Task::perform(ipc::request(UiRequest::PairCancel), Message::PairLoaded),
                     Task::perform(ipc::request(UiRequest::Status), Message::StatusLoaded),
                 ])
             }
@@ -500,8 +507,6 @@ impl App {
             daemon,
             horizontal_rule(1),
             binp,
-            horizontal_rule(1),
-            text("Pairing moves here next (it drives a `deskorynd pair` subprocess).").size(12),
         ]
         .spacing(16)
         .into()
@@ -565,8 +570,53 @@ impl App {
     }
 
     fn pairing_view(&self) -> Element<'_, Message> {
-        let panel = match &self.pairing {
-            PairState::Idle => {
+        let panel = match self.pair_phase.as_str() {
+            "prompt" => column![
+                text(if self.pair_peer.is_empty() {
+                    "Pair with this device?".to_string()
+                } else {
+                    format!("Pair with “{}”?", self.pair_peer)
+                })
+                .size(16),
+                text("Confirm this code matches on BOTH machines:").size(13),
+                text(self.pair_sas.clone()).size(40),
+                text("If they differ, someone may be intercepting — don't continue.").size(12),
+                row![
+                    button("They don't match").on_press(Message::PairRespond(false)).style(button::danger),
+                    button("Confirm").on_press(Message::PairRespond(true)).style(button::primary),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10),
+            "discoverable" => column![
+                text("Pairing").size(16),
+                text("Waiting for a peer to connect…").size(14),
+                button("Cancel").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            "connecting" => column![
+                text("Pairing").size(16),
+                text("Connecting…").size(14),
+                button("Cancel").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            "paired" => column![
+                text(format!("Paired with {} ✓", self.pair_peer)).size(16),
+                button("Close").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            "aborted" => column![
+                text("Pairing aborted").size(16),
+                button("Close").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            "error" => column![
+                text(format!("Pairing error: {}", self.pair_peer)).size(14),
+                button("Close").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            // idle
+            _ => {
                 let wait = button("Wait for a peer")
                     .on_press(Message::PairRoleListen(true))
                     .style(if self.pair_listen { button::primary } else { button::secondary });
@@ -585,53 +635,16 @@ impl App {
                             .on_input(Message::PairAddrChanged),
                     );
                 }
-                if self.life.running {
-                    c = c.push(text("Stop the daemon first — pairing uses the same port.").size(12));
-                    c = c.push(button("Start pairing")); // disabled while the daemon runs
-                } else {
+                // The daemon performs pairing on its live endpoint, so it must be
+                // running and reachable.
+                if self.reachable {
                     c = c.push(button("Start pairing").on_press(Message::PairStart));
+                } else {
+                    c = c.push(text("Start the daemon first (Connection tab).").size(12));
+                    c = c.push(button("Start pairing"));
                 }
                 c
             }
-            PairState::Waiting => column![
-                text("Pairing").size(16),
-                text("Waiting for a peer to connect…").size(14),
-                button("Cancel").on_press(Message::PairClear),
-            ]
-            .spacing(8),
-            PairState::Connecting => column![
-                text("Pairing").size(16),
-                text("Connecting…").size(14),
-                button("Cancel").on_press(Message::PairClear),
-            ]
-            .spacing(8),
-            PairState::Prompt { sas, peer } => column![
-                text(if peer.is_empty() {
-                    "Pair with this device?".to_string()
-                } else {
-                    format!("Pair with “{peer}”?")
-                })
-                .size(16),
-                text("Confirm this code matches on BOTH machines:").size(13),
-                text(sas.clone()).size(40),
-                text("If they differ, someone may be intercepting — don't continue.").size(12),
-                row![
-                    button("They don't match").on_press(Message::PairRespond(false)).style(button::danger),
-                    button("Confirm").on_press(Message::PairRespond(true)).style(button::primary),
-                ]
-                .spacing(8),
-            ]
-            .spacing(10),
-            PairState::Done { ok } => column![
-                text(if *ok { "Paired ✓" } else { "Pairing aborted" }).size(16),
-                button("Close").on_press(Message::PairClear),
-            ]
-            .spacing(8),
-            PairState::Error(msg) => column![
-                text(format!("Pairing error: {msg}")).size(14),
-                button("Close").on_press(Message::PairClear),
-            ]
-            .spacing(8),
         };
         panel.into()
     }

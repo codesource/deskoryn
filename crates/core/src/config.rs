@@ -25,6 +25,7 @@ pub enum ConfigError {
 ///
 /// * Linux:   `~/.config/deskoryn`, `~/.local/share/deskoryn`
 /// * Windows: `%APPDATA%\Deskoryn\config`, `%APPDATA%\Deskoryn\data`
+#[derive(Clone, Debug)]
 pub struct Paths {
     pub config_dir: PathBuf,
     pub state_dir: PathBuf,

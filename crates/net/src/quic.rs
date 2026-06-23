@@ -566,4 +566,35 @@ impl QuicEndpoint {
         let session = QuicSession::establish(conn, false, peer, fp).await?;
         Ok(Box::new(session))
     }
+
+    /// Accept the next inbound connection, classifying it by trust: a known
+    /// fingerprint yields a ready [`Session`]; an unknown one yields the raw
+    /// [`QuicSession`] so the caller can decide (reject, or run a pairing
+    /// handshake when a pairing window is open). This lets one running endpoint
+    /// serve both established peers and pairing on the same port.
+    pub async fn accept_any(&self) -> Result<Accepted, SessionError> {
+        let incoming = self.endpoint.accept().await.ok_or(SessionError::Closed)?;
+        let conn = incoming.await.map_err(te)?;
+        let fp = peer_fingerprint(&conn)?;
+        let peer = {
+            let trust = self.trust.lock().await;
+            trust.devices.iter().find(|d| d.fingerprint == fp).map(|d| d.id)
+        };
+        match peer {
+            Some(id) => Ok(Accepted::Trusted(Box::new(
+                QuicSession::establish(conn, false, id, fp).await?,
+            ))),
+            None => Ok(Accepted::Unknown(
+                QuicSession::establish(conn, false, DeviceId::from_bytes([0u8; 16]), fp).await?,
+            )),
+        }
+    }
+}
+
+/// Outcome of [`QuicEndpoint::accept_any`].
+pub enum Accepted {
+    /// The peer's certificate is pinned in the trust store.
+    Trusted(Box<dyn Session>),
+    /// Unknown peer — only proceed if a pairing window is open.
+    Unknown(QuicSession),
 }

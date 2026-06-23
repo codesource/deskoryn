@@ -23,6 +23,9 @@ mod input;
 mod ipc;
 mod monitors;
 mod pair;
+// Pairing runs on the real QUIC endpoint, so it's only built with a backend.
+#[cfg(any(feature = "linux", feature = "windows"))]
+mod pairing;
 mod session;
 mod supervisor;
 mod transfer;
