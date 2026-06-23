@@ -57,8 +57,9 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     let endpoint = Arc::new(QuicEndpoint::bind(config.network.listen_port, identity, trust.clone()).await?);
     tracing::info!(port = endpoint.local_port(), "QUIC endpoint bound");
 
-    // Local control socket for the tray UI / `deskorynd status`.
-    #[cfg(unix)]
+    // Local control channel for the tray UI / `deskorynd status` (Unix domain
+    // socket on Unix/macOS, named pipe on Windows).
+    #[cfg(any(unix, windows))]
     {
         use crate::ipc::{self, PeerStatus, UiEvent, UiRequest};
         let device_name = config.device.name.clone();

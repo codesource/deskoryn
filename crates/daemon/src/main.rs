@@ -173,9 +173,9 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Connect to a running daemon's control socket and print its status.
+/// Connect to a running daemon's control channel and print its status.
 async fn status_command(paths: &Paths) -> anyhow::Result<()> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         use ipc::{UiEvent, UiRequest};
         let socket = paths.socket_file();
@@ -199,10 +199,10 @@ async fn status_command(paths: &Paths) -> anyhow::Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = paths;
-        anyhow::bail!("status over the control socket is currently Unix-only")
+        anyhow::bail!("status over the control channel is not supported on this platform yet")
     }
 }
 

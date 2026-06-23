@@ -77,13 +77,25 @@ pub struct PeerStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Transport: length-prefixed JSON over a Unix domain socket (named pipe on
-// Windows — TODO). The daemon serves; the tray UI / `deskorynctl` connect.
+// Transport: length-prefixed JSON over a Unix domain socket (Unix/macOS) or a
+// named pipe (Windows). The daemon serves; the tray UI / `deskorynctl` connect.
+// The same path is passed on every OS; on Windows it maps to a pipe name.
 // ---------------------------------------------------------------------------
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Windows named-pipe name derived from the control-socket path's file name,
+/// e.g. `<state>/deskorynd.sock` → `\\.\pipe\deskorynd.sock`. The tray UI's
+/// client derives the same name from its resolved socket path, so they meet.
+#[cfg(windows)]
+fn pipe_name(path: &Path) -> String {
+    format!(
+        r"\\.\pipe\{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("deskorynd.sock")
+    )
+}
 
 /// A request handler: maps one [`UiRequest`] to the events to send back.
 pub type Handler = std::sync::Arc<dyn Fn(UiRequest) -> Vec<UiEvent> + Send + Sync>;
@@ -148,6 +160,48 @@ pub async fn request(path: &Path, req: &UiRequest) -> std::io::Result<Vec<UiEven
     write_msg(&mut stream, req).await?;
     let mut out = Vec::new();
     while let Some(ev) = read_msg::<UiEvent, _>(&mut stream).await? {
+        out.push(ev);
+    }
+    Ok(out)
+}
+
+/// Serve the control channel over a Windows named pipe. Each accepted client
+/// sends one request and receives the handler's response events; a fresh pipe
+/// instance is created before handling so clients are served concurrently.
+#[cfg(windows)]
+pub async fn serve(path: PathBuf, handler: Handler) -> std::io::Result<()> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    let name = pipe_name(&path);
+    let mut server = ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&name)?;
+    loop {
+        // Wait for a client, then immediately stand up the next instance.
+        server.connect().await?;
+        let mut connected = server;
+        server = ServerOptions::new().create(&name)?;
+
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(req)) = read_msg::<UiRequest, _>(&mut connected).await {
+                for ev in handler(req) {
+                    if write_msg(&mut connected, &ev).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Connect to the daemon's named pipe, send one request, collect the responses.
+#[cfg(windows)]
+pub async fn request(path: &Path, req: &UiRequest) -> std::io::Result<Vec<UiEvent>> {
+    use tokio::net::windows::named_pipe::ClientOptions;
+    let mut client = ClientOptions::new().open(pipe_name(path))?;
+    write_msg(&mut client, req).await?;
+    let mut out = Vec::new();
+    while let Some(ev) = read_msg::<UiEvent, _>(&mut client).await? {
         out.push(ev);
     }
     Ok(out)
