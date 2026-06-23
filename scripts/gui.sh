@@ -55,6 +55,31 @@ case "$cmd" in
       "$DAEMON" pair "127.0.0.1:$1" >/tmp/deskoryn-dial.log 2>&1 &
     echo "dialer started (log: /tmp/deskoryn-dial.log)"
     ;;
+  daemon-bg)
+    # Run a SECOND daemon with its own identity/socket (separate XDG dirs):
+    #   gui.sh daemon-bg /tmp/dsk-b
+    DIR="$1"; mkdir -p "$DIR/data" "$DIR/cfg"
+    XDG_DATA_HOME="$DIR/data" XDG_CONFIG_HOME="$DIR/cfg" \
+      setsid "$DAEMON" run >/tmp/deskoryn-b.log 2>&1 < /dev/null &
+    sleep 2; echo "daemon-bg socket=$DIR/data/deskoryn/deskorynd.sock"
+    ;;
+  ipc)
+    # Send one control-socket request and print the JSON responses:
+    #   gui.sh ipc <socket> '{"cmd":"pair","addr":""}'
+    python3 - "$1" "$2" <<'PY'
+import socket, struct, sys, json
+sock, req = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX); s.connect(sock)
+b = req.encode(); s.sendall(struct.pack('<I', len(b)) + b)
+buf = b''
+while True:
+    hdr = s.recv(4)
+    if len(hdr) < 4: break
+    n = struct.unpack('<I', hdr)[0]; data = b''
+    while len(data) < n: data += s.recv(n - len(data))
+    print(json.loads(data))
+PY
+    ;;
   kill) pkill -x deskoryn-ui 2>/dev/null || true; pkill -x deskorynd 2>/dev/null || true; echo killed ;;
   *) echo "usage: gui.sh {launch|win|click X Y|shot FILE|status|port|dial-pair PORT|kill}" >&2; exit 2 ;;
 esac
