@@ -59,6 +59,15 @@ pub fn playback_devices() -> Vec<AudioDevice> {
 /// [`AudioError::NoBackend`]. This is the single selection point the daemon's
 /// audio pump uses, mirroring [`open_codec`].
 pub fn open_capture(device: Option<&str>) -> Result<Box<dyn Capture>, AudioError> {
+    // On Windows, capturing "what's playing" means WASAPI loopback on the default
+    // render endpoint (cpal's default input is the mic). Use loopback when no
+    // explicit device id is requested; a named id falls through to cpal.
+    #[cfg(all(windows, feature = "windows-backend"))]
+    {
+        if device.is_none() {
+            return Ok(Box::new(crate::wasapi_loopback::WasapiLoopbackCapture::open()?));
+        }
+    }
     #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
     {
         return Ok(Box::new(crate::cpal_backend::CpalCapture::open(device)?));

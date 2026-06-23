@@ -173,11 +173,18 @@ resumes after an interruption, shows progress.
   frames (`audio::reframe::ReframingCapture`) and the sink builds its decoder
   from the `Start` message's format. Parks (without ending the session) when this
   machine has no audio role or backend.
-- ⬜ Remaining — capturing "what's playing": a Linux monitor-source default and
-  Windows **WASAPI loopback** (cpal's default input is the mic, not system
-  output); a native PipeWire backend with a dedicated "Deskoryn" virtual sink;
-  the **Windows libopus build** (cross-build needs `autoconf`/`automake`/`libtool`
-  for `audiopus_sys`'s vendored libopus — the cross-link itself is fine);
+- ✅ Windows **WASAPI loopback** capture (`audio::wasapi_loopback`, behind
+  `windows-backend`): grabs the default render endpoint's output ("what's
+  playing"); `open_capture(None)` prefers it on Windows. Compile-verified via the
+  gnu cross target; needs the Windows box for runtime validation.
+- ✅ Windows **libopus** unblocked: `scripts/build-opus-mingw.sh` cross-builds a
+  static `libopus.a` with mingw; the `.exe` then builds with `audio-opus` via
+  `OPUS_STATIC=1 OPUS_NO_PKG=1 OPUS_LIB_DIR=third_party/opus-mingw/lib`
+  (audiopus_sys's own vendored build can't cross-compile). Statically linked, no
+  opus DLL dependency.
+- ⬜ Remaining — a Linux monitor-source *default* for `open_capture` (today the
+  Linux source is the mic unless pointed at a monitor via config/pavucontrol);
+  a native PipeWire backend with a dedicated "Deskoryn" virtual sink;
   bidirectional forwarding; UI device pickers.
 
 **Exit:** Windows audio plays on Linux speakers with selectable latency; optional

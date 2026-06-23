@@ -25,6 +25,8 @@
 
 #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
 mod cpal_backend;
+#[cfg(all(windows, feature = "windows-backend"))]
+mod wasapi_loopback;
 pub mod jitter;
 pub mod platform;
 pub mod reframe;

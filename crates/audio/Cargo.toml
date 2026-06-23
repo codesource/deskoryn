@@ -10,8 +10,8 @@ license.workspace = true
 default = []
 # Real codec + OS audio backends, off by default.
 opus = ["dep:audiopus"]        # real Opus encode/decode (vendors libopus)
-linux-backend = ["dep:cpal"]   # device capture/playback via cpal (ALSA→PipeWire)
-windows-backend = ["dep:cpal"] # device capture/playback via cpal (WASAPI)
+linux-backend = ["dep:cpal"]              # device capture/playback via cpal (ALSA→PipeWire)
+windows-backend = ["dep:cpal", "dep:windows"] # cpal (WASAPI) + native WASAPI loopback capture
 
 [dependencies]
 deskoryn-core.workspace = true
@@ -25,3 +25,13 @@ audiopus = { version = "0.2", optional = true }
 # uses ALSA (routed through PipeWire's ALSA compatibility); on Windows, WASAPI.
 # A native PipeWire backend with a dedicated virtual sink is future polish.
 cpal = { version = "0.15", optional = true }
+
+# Windows-only: native WASAPI loopback capture ("what's playing"), which cpal's
+# default-input path can't do. Version matches cpal's `windows` to dedupe.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+] }
