@@ -158,8 +158,27 @@ resumes after an interruption, shows progress.
   on Linux with `libopus-dev`: codec round-trip + the full capture→encode→
   datagram→jitter→decode pipeline through real Opus over loopback. Windows Opus
   needs a cross/native libopus build (tracked below).
-- ⬜ OS backends — WASAPI loopback (Windows) / PipeWire monitor + virtual sink
-  (Linux); device pickers; Windows libopus build for the `.exe`.
+- ✅ OS device I/O via `cpal` (`audio::cpal_backend`, behind the daemon
+  `linux`/`windows` meta-features): `open_capture`/`open_playback` selectors +
+  real device enumeration (sources, sink monitors, sinks). On Linux cpal uses
+  ALSA routed through PipeWire's compat layer; on Windows, WASAPI. `deskorynd
+  audio-test [--list]` exercises it in isolation (lists devices; loops
+  capture→playback locally). **Device enumeration hardware-validated** on the
+  Linux PC (lists `pipewire`/`pulse`/`default` + the hardware cards); the
+  capture→playback loop is user-run (needs speakers/ears).
+- ✅ Audio pump wired into the live per-peer session (`session::run` →
+  `audio::run_audio_pump`): single direction, role by `audio.forward_enabled`
+  (source captures+streams; otherwise plays a forwarding peer's audio), gated on
+  the peer's `audio_forward` capability. Capture is re-framed to fixed Opus
+  frames (`audio::reframe::ReframingCapture`) and the sink builds its decoder
+  from the `Start` message's format. Parks (without ending the session) when this
+  machine has no audio role or backend.
+- ⬜ Remaining — capturing "what's playing": a Linux monitor-source default and
+  Windows **WASAPI loopback** (cpal's default input is the mic, not system
+  output); a native PipeWire backend with a dedicated "Deskoryn" virtual sink;
+  the **Windows libopus build** (cross-build needs `autoconf`/`automake`/`libtool`
+  for `audiopus_sys`'s vendored libopus — the cross-link itself is fine);
+  bidirectional forwarding; UI device pickers.
 
 **Exit:** Windows audio plays on Linux speakers with selectable latency; optional
 reverse direction.

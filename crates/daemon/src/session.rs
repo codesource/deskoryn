@@ -36,14 +36,16 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
 
     // Read the peer's Hello and merge layouts.
     let mut layout = config.layout.clone();
+    let mut peer_forwards_audio = false;
     if let Some(frame) = ctl_rx.recv_bytes().await? {
         let mut b = bytes::BytesMut::from(&frame[..]);
-        if let Some(Control::Hello { name, monitors, version, .. }) =
+        if let Some(Control::Hello { name, monitors, version, capabilities, .. }) =
             deskoryn_proto::decode_one::<Control>(&mut b)?
         {
             tracing::info!(peer_name = %name, ?version, "peer hello");
             // The combined virtual desktop is the union of both monitor sets.
             layout.monitors.extend(monitors.monitors);
+            peer_forwards_audio = capabilities.audio_forward;
         }
     }
 
@@ -110,11 +112,24 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
         config.file_transfer.max_concurrent_transfers,
     ));
 
+    // Audio forwarding (single direction, role by config): a machine with
+    // `audio.forward_enabled` captures and streams its output; otherwise it
+    // plays what a forwarding peer sends. Parks (without ending the session)
+    // when this machine has no audio role or no backend. Uses QUIC datagrams,
+    // so it needs the `audio-opus` codec to fit frames into a datagram.
+    let audio: PumpFuture = Box::pin(crate::audio::run_audio_pump(
+        session.clone(),
+        config.audio.profile,
+        config.audio.forward_enabled,
+        peer_forwards_audio,
+    ));
+
     let end = tokio::select! {
         r = control => { r.map(|e| format!("{e:?}")) }
         r = input => { r.map(|_| "input pump ended".to_string()) }
         r = clipboard => { r.map(|_| "clipboard pump ended".to_string()) }
         r = dispatcher => { r.map(|_| "stream dispatcher ended".to_string()) }
+        r = audio => { r.map(|_| "audio pump ended".to_string()) }
     }?;
     tracing::info!(%peer, %end, "session ended");
     Ok(())

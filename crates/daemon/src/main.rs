@@ -107,6 +107,16 @@ enum Cmd {
         #[arg(long)]
         set: Option<String>,
     },
+    /// Exercise the local audio backend in isolation (list devices; loop
+    /// capture→playback locally so you can hear the captured source).
+    AudioTest {
+        /// Seconds to forward audio for.
+        #[arg(long, default_value_t = 10)]
+        secs: u64,
+        /// Only list capture/playback devices, then exit.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 #[tokio::main]
@@ -152,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Arrange { cmd } => arrange::run(config, &config_path, cmd),
         Cmd::InputTest { secs, inject } => diag::input_test(secs, inject).await,
         Cmd::ClipTest { secs, set } => diag::clip_test(config, secs, set).await,
+        Cmd::AudioTest { secs, list } => diag::audio_test(config, secs, list).await,
         Cmd::Devices => {
             let store = deskoryn_core::trust::TrustStore::load(&paths.trust_file())?;
             for d in &store.devices {

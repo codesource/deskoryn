@@ -13,8 +13,8 @@ path = "src/main.rs"
 [features]
 default = []
 # Convenience meta-features to turn on real backends for a real build.
-linux = ["deskoryn-net/full", "deskoryn-input/linux-backend", "deskoryn-clipboard/linux-backend"]
-windows = ["deskoryn-net/full", "deskoryn-input/windows-backend", "deskoryn-clipboard/windows-backend"]
+linux = ["deskoryn-net/full", "deskoryn-input/linux-backend", "deskoryn-clipboard/linux-backend", "deskoryn-audio/linux-backend"]
+windows = ["deskoryn-net/full", "deskoryn-input/windows-backend", "deskoryn-clipboard/windows-backend", "deskoryn-audio/windows-backend"]
 # Opt-in real Opus codec (needs libopus / pkg-config at build time).
 audio-opus = ["deskoryn-audio/opus"]
 

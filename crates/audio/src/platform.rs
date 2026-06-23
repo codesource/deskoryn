@@ -1,6 +1,6 @@
 //! Audio backend selection, device enumeration, and a pass-through codec.
 
-use crate::{AudioDevice, AudioError, Codec};
+use crate::{AudioDevice, AudioError, Capture, Codec, Playback};
 use deskoryn_core::config::AudioProfile;
 
 /// Pick the best codec for this build: the real Opus codec when the `opus`
@@ -19,9 +19,17 @@ pub fn open_codec(sample_rate: u32, channels: u8, profile: AudioProfile) -> Box<
     Box::new(PassthroughCodec)
 }
 
-/// Enumerate capture devices (sources). Real backends query PipeWire/WASAPI; the
-/// default build returns just a synthetic "default" so the UI has something.
+/// Enumerate capture devices (sources, including sink monitors for loopback).
+/// With a backend feature on, queries the real host (cpal); the default build
+/// returns just a synthetic "default" so the UI has something.
 pub fn capture_devices() -> Vec<AudioDevice> {
+    #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+    {
+        let devs = crate::cpal_backend::capture_devices();
+        if !devs.is_empty() {
+            return devs;
+        }
+    }
     vec![AudioDevice {
         id: "default".into(),
         label: "System default".into(),
@@ -31,11 +39,49 @@ pub fn capture_devices() -> Vec<AudioDevice> {
 
 /// Enumerate playback devices (sinks).
 pub fn playback_devices() -> Vec<AudioDevice> {
+    #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+    {
+        let devs = crate::cpal_backend::playback_devices();
+        if !devs.is_empty() {
+            return devs;
+        }
+    }
     vec![AudioDevice {
         id: "default".into(),
         label: "System default".into(),
         is_default: true,
     }]
+}
+
+/// Open a capture source (a device id from [`capture_devices`], or the default
+/// when `None`). The real backend (cpal) is compiled in behind the per-OS
+/// backend feature; the default portable build has no device I/O and returns
+/// [`AudioError::NoBackend`]. This is the single selection point the daemon's
+/// audio pump uses, mirroring [`open_codec`].
+pub fn open_capture(device: Option<&str>) -> Result<Box<dyn Capture>, AudioError> {
+    #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+    {
+        return Ok(Box::new(crate::cpal_backend::CpalCapture::open(device)?));
+    }
+    #[cfg(not(any(feature = "linux-backend", feature = "windows-backend")))]
+    {
+        let _ = device;
+        Err(AudioError::NoBackend)
+    }
+}
+
+/// Open a playback sink (a device id from [`playback_devices`], or the default
+/// when `None`). See [`open_capture`].
+pub fn open_playback(device: Option<&str>) -> Result<Box<dyn Playback>, AudioError> {
+    #[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+    {
+        return Ok(Box::new(crate::cpal_backend::CpalPlayback::open(device)?));
+    }
+    #[cfg(not(any(feature = "linux-backend", feature = "windows-backend")))]
+    {
+        let _ = device;
+        Err(AudioError::NoBackend)
+    }
 }
 
 /// A no-op codec that copies PCM<->bytes so the streaming pipeline runs end to

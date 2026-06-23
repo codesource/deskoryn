@@ -23,10 +23,14 @@
 //!   [`AudioProfile`](deskoryn_core::config::AudioProfile) (tiny for low-latency
 //!   calls/gaming, larger for glitch-free music/video).
 
+#[cfg(any(feature = "linux-backend", feature = "windows-backend"))]
+mod cpal_backend;
 pub mod jitter;
 pub mod platform;
+pub mod reframe;
 
 pub use jitter::{JitterBuffer, Pop};
+pub use reframe::Reframer;
 
 use async_trait::async_trait;
 

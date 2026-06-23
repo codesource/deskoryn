@@ -160,3 +160,77 @@ pub async fn clip_test(
     println!("observed {count} clipboard change(s).");
     Ok(())
 }
+
+/// `deskorynd audio-test` — exercise the local audio backend in isolation.
+///
+/// Lists the host's capture/playback devices, then (unless `--list`) opens the
+/// configured source + sink and forwards captured PCM straight to playback for a
+/// few seconds — a *local* loopback through the real backend, no peer or
+/// network. Capturing a sink's `.monitor` source lets you hear "what's playing"
+/// looped back, which is the same capture path audio forwarding uses.
+///
+/// With the portable build there is no device I/O (`open_capture` returns
+/// `NoBackend`); rebuild with `--features linux` (or `windows`).
+pub async fn audio_test(
+    config: std::sync::Arc<deskoryn_core::config::AppConfig>,
+    secs: u64,
+    list: bool,
+) -> anyhow::Result<()> {
+    use deskoryn_audio::platform::{capture_devices, open_capture, open_playback, playback_devices};
+    use std::time::Duration;
+
+    let real_backend = cfg!(any(feature = "linux", feature = "windows"));
+    if !real_backend {
+        println!(
+            "audio backend: none (portable build) — no device capture/playback.\n\
+             rebuild with the OS backend to test real audio, e.g.:\n  \
+             cargo run -p deskoryn-daemon --features linux -- audio-test"
+        );
+        return Ok(());
+    }
+
+    println!("capture devices (sources / monitors):");
+    for d in capture_devices() {
+        println!("  {} {}", if d.is_default { "*" } else { " " }, d.label);
+    }
+    println!("playback devices (sinks):");
+    for d in playback_devices() {
+        println!("  {} {}", if d.is_default { "*" } else { " " }, d.label);
+    }
+    if list {
+        return Ok(());
+    }
+
+    // "default" is the config sentinel for the host default device.
+    let as_opt = |s: &str| (s != "default").then(|| s.to_string());
+    let src = as_opt(&config.audio.source_device);
+    let sink = as_opt(&config.audio.sink_device);
+
+    let mut capture = open_capture(src.as_deref())?;
+    let mut playback = open_playback(sink.as_deref())?;
+    println!(
+        "looping capture → playback for {secs}s at {} Hz / {} ch (you should hear the captured source)…",
+        capture.sample_rate(),
+        capture.channels()
+    );
+
+    let deadline = tokio::time::sleep(Duration::from_secs(secs));
+    tokio::pin!(deadline);
+    let mut frames = 0u64;
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            frame = capture.next_frame() => {
+                match frame? {
+                    Some(pcm) => {
+                        playback.play(&pcm).await?;
+                        frames += 1;
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    println!("forwarded {frames} audio frame(s).");
+    Ok(())
+}

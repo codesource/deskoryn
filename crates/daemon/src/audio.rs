@@ -4,8 +4,8 @@
 //! ride **QUIC datagrams** (`session.send_datagram`) so loss is concealed and
 //! never stalls input/clipboard. See `docs/PROTOCOL.md`.
 
-// Wired to PipeWire/WASAPI + the real Opus codec in M5; exercised today by the
-// integration test with a passthrough codec over the loopback session.
+// The pump logic is exercised by the integration test over the loopback session;
+// `run_audio_pump` wires it into the live per-peer session (M5).
 #![allow(dead_code)]
 
 use bytes::BytesMut;
@@ -15,6 +15,56 @@ use deskoryn_net::transport::{Session, Sink, Source};
 use deskoryn_proto::{
     decode_one, encode, from_datagram, to_datagram, AudioControl, AudioFrame, Channel,
 };
+use std::sync::Arc;
+
+/// Run the audio-forwarding pump for one peer session, in a single direction
+/// chosen by config:
+///
+/// * **source** (`forward` = `config.audio.forward_enabled`): capture this
+///   machine's output, re-frame to Opus frames, encode, and stream as datagrams.
+/// * **sink** (otherwise, when the peer forwards): play what the peer sends.
+///
+/// Returns a never-ending future when this machine has no audio role or no
+/// backend, so it simply parks in the session's `select!` without ending it.
+/// Real forwarding needs the `audio-opus` codec (raw PCM frames don't fit a
+/// datagram) and a 48 kHz-capable default device; without them it stays idle.
+pub async fn run_audio_pump(
+    session: Arc<dyn Session>,
+    profile: AudioProfile,
+    forward: bool,
+    peer_forwards: bool,
+) -> anyhow::Result<()> {
+    use deskoryn_audio::platform::{open_capture, open_codec, open_playback};
+    use deskoryn_audio::reframe::{frame_ms, ReframingCapture};
+
+    if forward {
+        let capture = match open_capture(None) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "audio: no capture backend; not forwarding");
+                return std::future::pending().await;
+            }
+        };
+        let (rate, channels) = (capture.sample_rate(), capture.channels());
+        tracing::info!(rate, channels, ?profile, "audio: forwarding this machine's output");
+        let framed: Box<dyn Capture> = Box::new(ReframingCapture::new(capture, profile));
+        let codec = open_codec(rate, channels, profile);
+        run_audio_source(session.as_ref(), framed, codec, 0, profile, frame_ms(profile) * 1000).await
+    } else if peer_forwards {
+        let playback = match open_playback(None) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "audio: no playback backend; not receiving");
+                return std::future::pending().await;
+            }
+        };
+        tracing::info!("audio: playing peer's forwarded audio");
+        run_audio_sink(session.as_ref(), playback, open_codec).await
+    } else {
+        // Neither side forwards: nothing to do.
+        std::future::pending().await
+    }
+}
 
 /// Source side: announce the stream, then capture → encode → datagram until the
 /// capture device stops.
@@ -51,16 +101,25 @@ pub async fn run_audio_source(
 
 /// Sink side: receive the announcement, buffer datagrams in a jitter buffer, and
 /// play them out (concealing gaps), draining on `Stop`.
-pub async fn run_audio_sink(
+///
+/// The decoder is built from `Start` (via `make_codec`) because the source's
+/// sample rate / channels / profile aren't known until then.
+pub async fn run_audio_sink<F>(
     session: &dyn Session,
     mut playback: Box<dyn Playback>,
-    mut codec: Box<dyn Codec>,
-) -> anyhow::Result<()> {
+    make_codec: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(u32, u8, AudioProfile) -> Box<dyn Codec>,
+{
     let (_ctl_tx, mut ctl_rx) = session.channel(Channel::Audio).await?;
 
-    // Wait for Start to learn the jitter depth from the profile.
-    let mut jitter = match recv_ctl(&mut ctl_rx).await? {
-        Some(AudioControl::Start { profile, .. }) => JitterBuffer::new(JitterBuffer::depth_for(profile)),
+    // Wait for Start to learn the format (codec) and jitter depth (profile).
+    let (mut jitter, mut codec) = match recv_ctl(&mut ctl_rx).await? {
+        Some(AudioControl::Start { profile, sample_rate, channels, .. }) => (
+            JitterBuffer::new(JitterBuffer::depth_for(profile)),
+            make_codec(sample_rate, channels, profile),
+        ),
         Some(other) => anyhow::bail!("expected Start, got {other:?}"),
         None => return Ok(()),
     };
@@ -201,7 +260,7 @@ mod tests {
         let playback = Box::new(VecPlayback { out: out.clone() });
 
         let sink = tokio::spawn(async move {
-            run_audio_sink(sink_sess.as_ref(), playback, Box::new(PassthroughCodec)).await
+            run_audio_sink(sink_sess.as_ref(), playback, |_, _, _| Box::new(PassthroughCodec)).await
         });
 
         let capture = Box::new(VecCapture { frames: frames.into_iter() });
@@ -244,9 +303,9 @@ mod tests {
         let out = Arc::new(Mutex::new(Vec::new()));
         let playback = Box::new(VecPlayback { out: out.clone() });
 
-        let sink_codec = open_codec(48_000, 2, AudioProfile::LowLatency);
         let sink = tokio::spawn(async move {
-            run_audio_sink(sink_sess.as_ref(), playback, sink_codec).await
+            // The decoder is built from the Start message's format.
+            run_audio_sink(sink_sess.as_ref(), playback, open_codec).await
         });
 
         let src_codec = open_codec(48_000, 2, AudioProfile::LowLatency);
