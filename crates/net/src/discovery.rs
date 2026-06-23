@@ -20,6 +20,9 @@ pub struct PeerHint {
     /// Advertised certificate fingerprint, if any. Lets us reject an imposter
     /// before opening a connection (it must still match the pinned value).
     pub fingerprint: Option<CertFingerprint>,
+    /// The peer is currently advertising that it's accepting pairing (its
+    /// discoverable window is open). Drives the "nearby waiting to pair" list.
+    pub pairing: bool,
 }
 
 /// The Deskoryn DNS-SD service type.
@@ -35,6 +38,10 @@ pub trait Discovery: Send + Sync {
     /// only surface changes.
     async fn next_peer(&self) -> Option<PeerHint>;
 
+    /// Toggle the advertised "accepting pairing" flag (re-advertises). No-op
+    /// before [`advertise`] has been called.
+    async fn set_pairing(&self, on: bool) -> std::io::Result<()>;
+
     async fn shutdown(&self);
 }
 
@@ -49,6 +56,9 @@ impl Discovery for NullDiscovery {
     }
     async fn next_peer(&self) -> Option<PeerHint> {
         std::future::pending().await
+    }
+    async fn set_pairing(&self, _on: bool) -> std::io::Result<()> {
+        Ok(())
     }
     async fn shutdown(&self) {}
 }
@@ -72,16 +82,40 @@ pub mod mdns {
     use std::sync::Mutex as StdMutex;
     use tokio::sync::{mpsc, Mutex};
 
+    /// Advertise parameters, kept so the `pair` flag can be toggled by
+    /// re-registering with updated TXT records.
+    #[derive(Clone)]
+    struct AdvertiseParams {
+        device: DeviceId,
+        name: String,
+        port: u16,
+        fp: CertFingerprint,
+    }
+
     pub struct MdnsDiscovery {
         daemon: ServiceDaemon,
         rx: Mutex<mpsc::UnboundedReceiver<PeerHint>>,
         tx: mpsc::UnboundedSender<PeerHint>,
-        /// Registered service fullname, kept so we can unregister on shutdown.
+        /// Registered service fullname, kept so we can unregister/re-register.
         registered: StdMutex<Option<String>>,
+        params: StdMutex<Option<AdvertiseParams>>,
     }
 
     fn io(e: impl std::fmt::Display) -> std::io::Error {
         std::io::Error::other(e.to_string())
+    }
+
+    fn build_info(p: &AdvertiseParams, pairing: bool) -> std::io::Result<ServiceInfo> {
+        let instance = p.device.short();
+        let host = format!("{}.local.", p.device.short());
+        let id_s = p.device.to_string();
+        let fp_s = hex::encode(p.fp.0);
+        let pair_s = if pairing { "1" } else { "0" };
+        let props: [(&str, &str); 4] =
+            [("id", &id_s), ("name", &p.name), ("fp", &fp_s), ("pair", pair_s)];
+        Ok(ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", p.port, &props[..])
+            .map_err(io)?
+            .enable_addr_auto())
     }
 
     impl MdnsDiscovery {
@@ -93,6 +127,7 @@ pub mod mdns {
                 rx: Mutex::new(rx),
                 tx,
                 registered: StdMutex::new(None),
+                params: StdMutex::new(None),
             })
         }
 
@@ -123,12 +158,14 @@ pub mod mdns {
             .unwrap_or("deskoryn")
             .to_string();
         let fingerprint = info.get_property_val_str("fp").and_then(parse_fp);
+        let pairing = info.get_property_val_str("pair").map(|s| s == "1").unwrap_or(false);
         let ip = info.get_addresses().iter().next().copied()?;
         Some(PeerHint {
             device,
             name,
             addr: SocketAddr::new(ip, info.get_port()),
             fingerprint,
+            pairing,
         })
     }
 
@@ -147,20 +184,14 @@ pub mod mdns {
             port: u16,
             fp: CertFingerprint,
         ) -> std::io::Result<()> {
-            let instance = device.short();
-            let host = format!("{}.local.", device.short());
-            let id_s = device.to_string();
-            let fp_s = hex::encode(fp.0);
-            let props: [(&str, &str); 3] = [("id", &id_s), ("name", name), ("fp", &fp_s)];
-
-            // Empty address + `enable_addr_auto` lets mdns-sd advertise the host's
-            // current interface addresses (and update them as they change).
-            let info = ServiceInfo::new(SERVICE_TYPE, &instance, &host, "", port, &props[..])
-                .map_err(io)?
-                .enable_addr_auto();
+            let params = AdvertiseParams { device, name: name.to_string(), port, fp };
+            // Empty address + `enable_addr_auto` (inside build_info) lets mdns-sd
+            // advertise the host's current interface addresses. Start not-pairing.
+            let info = build_info(&params, false)?;
             let fullname = info.get_fullname().to_string();
             self.daemon.register(info).map_err(io)?;
             *self.registered.lock().unwrap() = Some(fullname);
+            *self.params.lock().unwrap() = Some(params);
 
             self.spawn_browser(device)?;
             Ok(())
@@ -168,6 +199,20 @@ pub mod mdns {
 
         async fn next_peer(&self) -> Option<PeerHint> {
             self.rx.lock().await.recv().await
+        }
+
+        async fn set_pairing(&self, on: bool) -> std::io::Result<()> {
+            let params = self.params.lock().unwrap().clone();
+            let Some(params) = params else { return Ok(()) };
+            let info = build_info(&params, on)?;
+            let new_full = info.get_fullname().to_string();
+            // Re-announce with the updated `pair` TXT.
+            if let Some(old) = self.registered.lock().unwrap().clone() {
+                let _ = self.daemon.unregister(&old);
+            }
+            self.daemon.register(info).map_err(io)?;
+            *self.registered.lock().unwrap() = Some(new_full);
+            Ok(())
         }
 
         async fn shutdown(&self) {

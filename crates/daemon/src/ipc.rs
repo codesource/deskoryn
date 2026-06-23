@@ -28,6 +28,8 @@ pub enum UiRequest {
     PairStatus,
     /// Cancel pairing / close the discoverable window / dismiss the result.
     PairCancel,
+    /// List nearby devices currently advertising that they accept pairing.
+    DiscoveredPeers,
     /// Forget a trusted device.
     Forget { device: String },
     /// Push an edited virtual-desktop layout.
@@ -59,6 +61,8 @@ pub enum UiEvent {
     /// Current pairing flow. `phase` ∈ idle | discoverable | connecting |
     /// prompt | paired | aborted | error; `sas`/`peer` set during prompt/result.
     Pairing { phase: String, sas: String, peer: String },
+    /// Nearby devices accepting pairing (from mDNS), for the "waiting to pair" list.
+    Discovered { peers: Vec<DiscoveredPeer> },
     /// File-transfer progress for the tray's progress UI.
     TransferProgress {
         tag: u64,
@@ -76,6 +80,18 @@ pub enum NoticeLevel {
     Info,
     Warning,
     Error,
+}
+
+/// A device discovered on the LAN that is advertising it accepts pairing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveredPeer {
+    pub name: String,
+    /// `host:port` the UI passes back to `Pair { addr }` to connect.
+    pub addr: String,
+    /// Short device id (for display / disambiguation).
+    pub device: String,
+    /// Already in our trust store (so the UI can hide / mark it).
+    pub trusted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

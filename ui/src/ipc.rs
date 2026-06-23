@@ -16,6 +16,7 @@ pub enum UiRequest {
     PairConfirm { accept: bool },
     PairStatus,
     PairCancel,
+    DiscoveredPeers,
     Forget { device: String },
     SetLayout { layout: serde_json::Value },
     SetFeature { feature: Feature, enabled: bool },
@@ -44,6 +45,9 @@ pub enum UiEvent {
         sas: String,
         peer: String,
     },
+    Discovered {
+        peers: Vec<DiscoveredPeer>,
+    },
     TransferProgress {
         tag: u64,
         name: String,
@@ -62,6 +66,14 @@ pub enum NoticeLevel {
     Info,
     Warning,
     Error,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveredPeer {
+    pub name: String,
+    pub addr: String,
+    pub device: String,
+    pub trusted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

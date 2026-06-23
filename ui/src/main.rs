@@ -22,7 +22,7 @@ use iced::widget::{
     Canvas, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
-use ipc::{Feature, PeerStatus, UiEvent, UiRequest};
+use ipc::{DiscoveredPeer, Feature, PeerStatus, UiEvent, UiRequest};
 
 pub fn main() -> iced::Result {
     iced::application("Deskoryn", App::update, App::view)
@@ -73,6 +73,7 @@ struct App {
     pair_peer: String,
     pair_listen: bool,
     pair_addr: String,
+    nearby: Vec<DiscoveredPeer>, // devices on the LAN currently accepting pairing
 
     // Monitor arranger
     arrangement: Vec<MonTile>,
@@ -104,6 +105,8 @@ enum Message {
     PairLoaded(Result<Vec<UiEvent>, String>),
     PairRespond(bool),
     PairClear,
+    PairDial(String),
+    DiscoveredLoaded(Result<Vec<UiEvent>, String>),
     // Monitor arranger
     ArrMoved { idx: usize, x: i32, y: i32 },
     ArrAlignTops,
@@ -134,6 +137,7 @@ impl App {
             pair_peer: String::new(),
             pair_listen: true,
             pair_addr: String::new(),
+            nearby: Vec::new(),
             arrangement: arranger::starter(),
         };
         let proc = app.proc.clone();
@@ -147,6 +151,7 @@ impl App {
             Task::perform(ipc::request(UiRequest::Status), Message::StatusLoaded),
             Task::perform(self.proc.clone().lifecycle(), Message::LifecycleLoaded),
             Task::perform(self.proc.clone().bin_info(), Message::BinLoaded),
+            Task::perform(ipc::request(UiRequest::DiscoveredPeers), Message::DiscoveredLoaded),
         ])
     }
 
@@ -186,7 +191,7 @@ impl App {
                             self.transfers.push((name.clone(), *fraction, *bytes_per_sec));
                         }
                         UiEvent::Notice { text, .. } => self.toast = Some(text.clone()),
-                        UiEvent::Pairing { .. } => {}
+                        UiEvent::Pairing { .. } | UiEvent::Discovered { .. } => {}
                     }
                 }
                 Task::none()
@@ -295,6 +300,9 @@ impl App {
             Message::PairStart => {
                 // Empty addr = make discoverable (wait); else dial that peer.
                 let addr = if self.pair_listen { String::new() } else { self.pair_addr.clone() };
+                // Optimistically leave idle so the fast PairStatus poll starts
+                // immediately (the daemon's reply snapshot can race the handshake).
+                self.pair_phase = if self.pair_listen { "discoverable" } else { "connecting" }.into();
                 Task::perform(ipc::request(UiRequest::Pair { addr }), Message::PairLoaded)
             }
             Message::PairPoll => {
@@ -304,9 +312,14 @@ impl App {
                 if let Some(UiEvent::Pairing { phase, sas, peer }) =
                     events.into_iter().find(|e| matches!(e, UiEvent::Pairing { .. }))
                 {
-                    self.pair_phase = phase;
-                    self.pair_sas = sas;
-                    self.pair_peer = peer;
+                    // Don't let a racy/stale "idle" snapshot (the dial reply can
+                    // arrive before the handshake updates state) cancel an active
+                    // flow — returning to idle is driven locally by PairClear.
+                    if phase != "idle" {
+                        self.pair_phase = phase;
+                        self.pair_sas = sas;
+                        self.pair_peer = peer;
+                    }
                 }
                 Task::none()
             }
@@ -318,6 +331,22 @@ impl App {
                 ipc::request(UiRequest::PairConfirm { accept }),
                 Message::PairLoaded,
             ),
+            Message::PairDial(addr) => {
+                self.pair_phase = "connecting".into(); // start the fast poll now
+                Task::perform(ipc::request(UiRequest::Pair { addr }), Message::PairLoaded)
+            }
+            Message::DiscoveredLoaded(Ok(events)) => {
+                if let Some(UiEvent::Discovered { peers }) =
+                    events.into_iter().find(|e| matches!(e, UiEvent::Discovered { .. }))
+                {
+                    self.nearby = peers;
+                }
+                Task::none()
+            }
+            Message::DiscoveredLoaded(Err(_)) => {
+                self.nearby.clear();
+                Task::none()
+            }
             Message::PairClear => {
                 self.pair_phase = "idle".into();
                 self.pair_sas.clear();
@@ -623,12 +652,28 @@ impl App {
                 let connect = button("Connect to a peer")
                     .on_press(Message::PairRoleListen(false))
                     .style(if self.pair_listen { button::secondary } else { button::primary });
-                let mut c = column![
-                    text("Pair a new device").size(16),
-                    text("Confirm the same 6-digit code shows on both machines.").size(12),
-                    row![wait, connect].spacing(8),
-                ]
-                .spacing(8);
+                let mut c = column![text("Pair a new device").size(16)].spacing(8);
+
+                // Nearby devices currently accepting pairing (auto-discovered).
+                let nearby: Vec<_> = self.nearby.iter().filter(|p| !p.trusted).collect();
+                if !nearby.is_empty() {
+                    c = c.push(text("Nearby — waiting to pair:").size(13));
+                    for p in nearby {
+                        c = c.push(
+                            row![
+                                text(format!("● {}", p.name)).width(Length::Fill),
+                                text(p.device.clone()).size(11),
+                                button("Pair").on_press(Message::PairDial(p.addr.clone())).style(button::primary),
+                            ]
+                            .spacing(10)
+                            .align_y(Alignment::Center),
+                        );
+                    }
+                    c = c.push(horizontal_rule(1));
+                }
+
+                c = c.push(text("Or pair manually — confirm the same 6-digit code on both machines.").size(12));
+                c = c.push(row![wait, connect].spacing(8));
                 if !self.pair_listen {
                     c = c.push(
                         text_input("192.168.1.42:7345", &self.pair_addr)

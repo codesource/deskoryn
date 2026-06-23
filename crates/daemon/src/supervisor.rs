@@ -39,6 +39,18 @@ pub async fn run(config: Arc<AppConfig>, paths: Paths, dry_run: bool) -> anyhow:
 /// Real, networked run: bind a QUIC endpoint, accept inbound sessions, and dial
 /// known peers with auto-reconnect. Requires the `linux`/`windows` feature
 /// (which enables `deskoryn-net/full`).
+/// A peer last seen over mDNS.
+#[cfg(any(feature = "linux", feature = "windows"))]
+struct DiscEntry {
+    name: String,
+    addr: std::net::SocketAddr,
+    pairing: bool,
+    last_seen: std::time::Instant,
+}
+
+#[cfg(any(feature = "linux", feature = "windows"))]
+type Discovered = tokio::sync::Mutex<std::collections::HashMap<deskoryn_core::DeviceId, DiscEntry>>;
+
 #[cfg(any(feature = "linux", feature = "windows"))]
 async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     use deskoryn_core::trust::TrustStore;
@@ -61,6 +73,10 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     // confirm) and the accept loop (route an untrusted peer into pairing).
     let pairing = Arc::new(crate::pairing::Pairing::default());
 
+    // Live map of peers seen over mDNS, refreshed by the discovery loop and read
+    // by the IPC handler for the "nearby waiting to pair" list.
+    let discovered: Arc<Discovered> = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Local control channel for the tray UI / `deskorynd status` (Unix domain
     // socket on Unix/macOS, named pipe on Windows).
     #[cfg(any(unix, windows))]
@@ -76,6 +92,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let config_ipc = config.clone();
         let paths_ipc = paths.clone();
         let local_fp_ipc = identity_fp;
+        let discovered_ipc = discovered.clone();
 
         // Map a pairing snapshot to the wire event.
         fn pairing_event(s: crate::pairing::PairState) -> UiEvent {
@@ -121,9 +138,34 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             let endpoint = endpoint_ipc.clone();
             let config = config_ipc.clone();
             let paths = paths_ipc.clone();
+            let discovered = discovered_ipc.clone();
             Box::pin(async move {
                 match req {
                     UiRequest::Status => status(&trust, device_name, listen_port).await,
+                    UiRequest::DiscoveredPeers => {
+                        use crate::ipc::DiscoveredPeer;
+                        let now = std::time::Instant::now();
+                        let d = discovered.lock().await;
+                        let t = trust.lock().await;
+                        let peers = d
+                            .iter()
+                            // mDNS re-announces on the pair-flag toggle and on TTL
+                            // refresh (~minutes), not every few seconds — so keep
+                            // entries for a TTL-sized window. Closing the window
+                            // re-announces pair=0, which removes it promptly.
+                            .filter(|(_, e)| {
+                                e.pairing
+                                    && now.duration_since(e.last_seen) < std::time::Duration::from_secs(150)
+                            })
+                            .map(|(id, e)| DiscoveredPeer {
+                                name: e.name.clone(),
+                                addr: e.addr.to_string(),
+                                device: id.short(),
+                                trusted: t.get(*id).is_some(),
+                            })
+                            .collect();
+                        vec![UiEvent::Discovered { peers }]
+                    }
                     UiRequest::PairStatus => vec![pairing_event(pairing.snapshot().await)],
                     UiRequest::PairConfirm { accept } => {
                         pairing.respond(accept).await;
@@ -197,7 +239,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     }
 
     if config.network.discovery_enabled {
-        match start_discovery(&config, &endpoint, &trust, identity_fp).await {
+        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered).await {
             Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),
             Err(e) => tracing::warn!(error = %e, "mDNS discovery unavailable"),
         }
@@ -305,6 +347,8 @@ async fn start_discovery(
     endpoint: &Arc<deskoryn_net::quic::QuicEndpoint>,
     trust: &Arc<tokio::sync::Mutex<deskoryn_core::trust::TrustStore>>,
     fingerprint: deskoryn_core::trust::CertFingerprint,
+    pairing: &Arc<crate::pairing::Pairing>,
+    discovered: &Arc<Discovered>,
 ) -> anyhow::Result<()> {
     use deskoryn_net::discovery::{mdns::MdnsDiscovery, Discovery};
 
@@ -312,10 +356,13 @@ async fn start_discovery(
     discovery
         .advertise(config.device.id, &config.device.name, endpoint.local_port(), fingerprint)
         .await?;
+    // Let the pairing coordinator toggle the advertised "accepting pairing" flag.
+    pairing.set_discovery(discovery.clone());
 
     let endpoint = endpoint.clone();
     let config = config.clone();
     let trust = trust.clone();
+    let discovered = discovered.clone();
     // Peers we already have a session with (or are dialing), so repeated mDNS
     // re-resolutions don't spawn a storm of duplicate connections.
     let active: Arc<tokio::sync::Mutex<std::collections::HashSet<deskoryn_core::DeviceId>>> =
@@ -323,9 +370,21 @@ async fn start_discovery(
 
     tokio::spawn(async move {
         while let Some(hint) = discovery.next_peer().await {
+            // Record every sighting (trusted or not) for the UI's nearby list.
+            {
+                let mut d = discovered.lock().await;
+                d.insert(
+                    hint.device,
+                    DiscEntry {
+                        name: hint.name.clone(),
+                        addr: hint.addr,
+                        pairing: hint.pairing,
+                        last_seen: std::time::Instant::now(),
+                    },
+                );
+            }
             let trusted = trust.lock().await.get(hint.device).is_some();
             if !trusted {
-                tracing::debug!(peer = %hint.device.short(), "discovered an unpaired peer; run `deskorynd pair` to connect");
                 continue;
             }
             // Deterministic single-dialer rule: only the smaller id initiates.

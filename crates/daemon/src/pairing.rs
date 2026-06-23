@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use deskoryn_core::config::{AppConfig, Paths};
 use deskoryn_core::trust::{CertFingerprint, TrustStore};
+use deskoryn_net::discovery::Discovery;
 use deskoryn_net::quic::QuicSession;
 use tokio::sync::{oneshot, Mutex};
 
@@ -45,6 +46,9 @@ struct Inner {
 pub struct Pairing {
     discoverable: AtomicBool,
     inner: Mutex<Inner>,
+    /// mDNS handle, so opening/closing the window also toggles the advertised
+    /// "accepting pairing" flag (set once discovery starts).
+    discovery: std::sync::Mutex<Option<Arc<dyn Discovery>>>,
 }
 
 impl Default for Pairing {
@@ -52,6 +56,7 @@ impl Default for Pairing {
         Self {
             discoverable: AtomicBool::new(false),
             inner: Mutex::new(Inner { state: PairState::Idle, confirm: None, busy: false }),
+            discovery: std::sync::Mutex::new(None),
         }
     }
 }
@@ -61,17 +66,33 @@ impl Pairing {
         self.discoverable.load(Ordering::SeqCst)
     }
 
+    /// Attach the mDNS handle so the window toggles the advertised flag.
+    pub fn set_discovery(&self, d: Arc<dyn Discovery>) {
+        *self.discovery.lock().unwrap() = Some(d);
+    }
+
+    /// Toggle the advertised "accepting pairing" flag (best-effort).
+    async fn advertise(&self, on: bool) {
+        let d = self.discovery.lock().unwrap().clone();
+        if let Some(d) = d {
+            let _ = d.set_pairing(on).await;
+        }
+    }
+
     /// Open/close the discoverable window (set by the UI's "Start pairing").
     pub async fn set_discoverable(&self, on: bool) {
         self.discoverable.store(on, Ordering::SeqCst);
-        let mut i = self.inner.lock().await;
-        if on {
-            if matches!(i.state, PairState::Idle | PairState::Done { .. } | PairState::Error(_)) {
-                i.state = PairState::Discoverable;
+        {
+            let mut i = self.inner.lock().await;
+            if on {
+                if matches!(i.state, PairState::Idle | PairState::Done { .. } | PairState::Error(_)) {
+                    i.state = PairState::Discoverable;
+                }
+            } else if matches!(i.state, PairState::Discoverable) {
+                i.state = PairState::Idle;
             }
-        } else if matches!(i.state, PairState::Discoverable) {
-            i.state = PairState::Idle;
         }
+        self.advertise(on).await;
     }
 
     pub async fn snapshot(&self) -> PairState {
@@ -81,10 +102,13 @@ impl Pairing {
     /// Record a failure (e.g. dial error) and end any in-flight flow.
     pub async fn fail(&self, msg: String) {
         self.discoverable.store(false, Ordering::SeqCst);
-        let mut i = self.inner.lock().await;
-        i.confirm = None;
-        i.busy = false;
-        i.state = PairState::Error(msg);
+        {
+            let mut i = self.inner.lock().await;
+            i.confirm = None;
+            i.busy = false;
+            i.state = PairState::Error(msg);
+        }
+        self.advertise(false).await;
     }
 
     /// Answer the in-flight SAS prompt.
@@ -98,12 +122,15 @@ impl Pairing {
     /// the discoverable window).
     pub async fn clear(&self) {
         self.discoverable.store(false, Ordering::SeqCst);
-        let mut i = self.inner.lock().await;
-        if let Some(tx) = i.confirm.take() {
-            let _ = tx.send(false);
+        {
+            let mut i = self.inner.lock().await;
+            if let Some(tx) = i.confirm.take() {
+                let _ = tx.send(false);
+            }
+            i.state = PairState::Idle;
+            i.busy = false;
         }
-        i.state = PairState::Idle;
-        i.busy = false;
+        self.advertise(false).await;
     }
 }
 
@@ -129,7 +156,9 @@ pub async fn run_handshake(
         i.busy = true;
         i.state = if initiator { PairState::Connecting } else { PairState::Discoverable };
     }
-    pairing.discoverable.store(false, Ordering::SeqCst); // accepting one is enough
+    // Accepting/handshaking one peer is enough — stop advertising.
+    pairing.discoverable.store(false, Ordering::SeqCst);
+    pairing.advertise(false).await;
 
     let outcome = handshake_inner(&pairing, &session, last_address, &config, local_fp, &trust, &paths).await;
 
