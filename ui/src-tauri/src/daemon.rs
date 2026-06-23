@@ -53,7 +53,7 @@ pub struct Lifecycle {
     pairing: bool,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
 struct UiSettings {
     daemon_bin: Option<String>,
 }
