@@ -8,9 +8,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
+use std::sync::{Arc, Mutex as StdMutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 
 const BIN: &str = if cfg!(windows) { "deskorynd.exe" } else { "deskorynd" };
@@ -18,7 +18,33 @@ const BIN: &str = if cfg!(windows) { "deskorynd.exe" } else { "deskorynd" };
 #[derive(Default)]
 pub struct ProcMgr {
     run: Mutex<Option<Child>>,
+    pair: Mutex<Option<PairProc>>,
+    /// Latest pairing state, written by the `deskorynd pair` stdout reader and
+    /// polled by the UI.
+    pair_state: StdMutex<PairState>,
     bin_override: Mutex<Option<PathBuf>>,
+}
+
+struct PairProc {
+    child: Child,
+    stdin: ChildStdin,
+}
+
+/// UI-facing pairing progress. Mirrors what the `deskorynd pair` subprocess
+/// prints to stdout (it shows the 6-digit SAS, then prompts `[y/N]`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PairState {
+    #[default]
+    Idle,
+    /// `pair --listen`: waiting for a peer to connect.
+    Waiting,
+    /// `pair <addr>`: dialing the peer.
+    Connecting,
+    /// Compare-and-confirm: the same code must show on both machines.
+    Prompt { sas: String, peer: String },
+    /// Finished: paired (`ok`) or aborted.
+    Done { ok: bool },
+    Error(String),
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +169,125 @@ impl ProcMgr {
         }
         Ok(())
     }
+
+    // --- pairing (drives a `deskorynd pair` subprocess) ---------------------
+
+    /// Start pairing: `pair --listen` (wait) or `pair <addr>` (dial). Pairing
+    /// binds the listen port, so the daemon must be stopped first. A background
+    /// reader parses the subprocess's stdout into [`PairState`].
+    pub async fn pair_start(
+        self: Arc<Self>,
+        listen: bool,
+        addr: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(child) = self.run.lock().await.as_mut() {
+            if matches!(child.try_wait(), Ok(None)) {
+                return Err("stop the daemon before pairing (they share the port)".into());
+            }
+        }
+        if self.pair.lock().await.is_some() {
+            return Err("a pairing is already in progress".into());
+        }
+        let bin = self.resolved_bin().await?;
+        let mut cmd = Command::new(&bin);
+        cmd.arg("pair");
+        if listen {
+            cmd.arg("--listen");
+        } else {
+            let a = addr
+                .filter(|s| !s.trim().is_empty())
+                .ok_or("enter the peer's host:port to pair as the connecting side")?;
+            cmd.arg(a.trim());
+        }
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", bin.display()))?;
+        let stdin = child.stdin.take().ok_or("no stdin on pair process")?;
+        let stdout = child.stdout.take().ok_or("no stdout on pair process")?;
+        drain(child.stderr.take());
+
+        *self.pair_state.lock().unwrap() = if listen {
+            PairState::Waiting
+        } else {
+            PairState::Connecting
+        };
+
+        // Parse stdout: the SAS prints as `NNN NNN`; the peer name on a
+        // `Pair with "name" (...)` line; the outcome as `Paired with …` / `aborted`.
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            let mut peer = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let t = line.trim();
+                if let Some(name) = parse_peer(t) {
+                    peer = name;
+                }
+                // Note: the `[y/N]` prompt has no trailing newline, so the
+                // outcome text shares its line — match with `contains`, not
+                // `starts_with`. Check the SAS last so the prompt line (which
+                // contains the outcome) wins over a stale `is_sas` match.
+                if t.contains("Paired with") {
+                    *me.pair_state.lock().unwrap() = PairState::Done { ok: true };
+                } else if t.contains("aborted") {
+                    *me.pair_state.lock().unwrap() = PairState::Done { ok: false };
+                } else if is_sas(t) {
+                    *me.pair_state.lock().unwrap() = PairState::Prompt {
+                        sas: t.to_string(),
+                        peer: peer.clone(),
+                    };
+                }
+            }
+            // Process ended: if we never reached a terminal state, flag it.
+            let mut st = me.pair_state.lock().unwrap();
+            if matches!(*st, PairState::Waiting | PairState::Connecting | PairState::Prompt { .. }) {
+                *st = PairState::Error("pairing process ended".into());
+            }
+        });
+
+        *self.pair.lock().await = Some(PairProc { child, stdin });
+        Ok(())
+    }
+
+    pub async fn pair_state(self: Arc<Self>) -> PairState {
+        self.pair_state.lock().unwrap().clone()
+    }
+
+    /// Answer the subprocess's `[y/N]` prompt.
+    pub async fn pair_respond(self: Arc<Self>, accept: bool) -> Result<(), String> {
+        let mut guard = self.pair.lock().await;
+        let p = guard.as_mut().ok_or("no pairing in progress")?;
+        p.stdin
+            .write_all(if accept { b"y\n" } else { b"n\n" })
+            .await
+            .map_err(|e| e.to_string())?;
+        p.stdin.flush().await.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Kill any pairing subprocess and reset to idle (cancel / dismiss result).
+    pub async fn pair_clear(self: Arc<Self>) {
+        if let Some(mut p) = self.pair.lock().await.take() {
+            let _ = p.child.start_kill();
+            let _ = p.child.wait().await;
+        }
+        *self.pair_state.lock().unwrap() = PairState::Idle;
+    }
+}
+
+fn is_sas(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() == 7
+        && b[3] == b' '
+        && b[..3].iter().all(u8::is_ascii_digit)
+        && b[4..].iter().all(u8::is_ascii_digit)
+}
+
+fn parse_peer(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("Pair with \"")?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 /// Spawn a task that swallows a child pipe's lines (prevents stdout backpressure).

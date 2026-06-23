@@ -14,7 +14,7 @@ mod ipc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use daemon::{BinInfo, Lifecycle, ProcMgr};
+use daemon::{BinInfo, Lifecycle, PairState, ProcMgr};
 use iced::widget::{
     button, checkbox, column, container, horizontal_rule, row, scrollable, text, text_input,
     Space,
@@ -64,6 +64,11 @@ struct App {
     bin_input: String,
     features: Features,
     toast: Option<String>,
+
+    // Pairing
+    pairing: PairState,
+    pair_listen: bool,
+    pair_addr: String,
 }
 
 #[derive(Clone, Debug)]
@@ -84,6 +89,15 @@ enum Message {
     SetFeature(Feature, bool),
     Forget(String),
     Acted(Result<Vec<UiEvent>, String>),
+    // Pairing
+    PairRoleListen(bool),
+    PairAddrChanged(String),
+    PairStart,
+    PairStarted(Result<(), String>),
+    PairPoll,
+    PairStateLoaded(PairState),
+    PairRespond(bool),
+    PairClear,
 }
 
 impl App {
@@ -104,6 +118,9 @@ impl App {
             bin_input: String::new(),
             features: Features { input: true, clipboard: true, audio: false },
             toast: None,
+            pairing: PairState::Idle,
+            pair_listen: true,
+            pair_addr: String::new(),
         };
         let proc = app.proc.clone();
         // Load the persisted binary override, then do a first refresh.
@@ -120,7 +137,17 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick)
+        let status = iced::time::every(Duration::from_secs(2)).map(|_| Message::Tick);
+        // While a pairing is live, poll its state quickly so the SAS code and
+        // outcome show promptly.
+        if self.pairing != PairState::Idle {
+            Subscription::batch([
+                status,
+                iced::time::every(Duration::from_millis(300)).map(|_| Message::PairPoll),
+            ])
+        } else {
+            status
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -242,6 +269,45 @@ impl App {
                     self.toast = Some(e.clone());
                 }
                 Task::perform(ipc::request(UiRequest::Status), Message::StatusLoaded)
+            }
+            Message::PairRoleListen(b) => {
+                self.pair_listen = b;
+                Task::none()
+            }
+            Message::PairAddrChanged(s) => {
+                self.pair_addr = s;
+                Task::none()
+            }
+            Message::PairStart => {
+                let listen = self.pair_listen;
+                let addr = (!listen).then(|| self.pair_addr.clone());
+                Task::perform(self.proc.clone().pair_start(listen, addr), Message::PairStarted)
+            }
+            Message::PairStarted(Ok(())) => {
+                Task::perform(self.proc.clone().pair_state(), Message::PairStateLoaded)
+            }
+            Message::PairStarted(Err(e)) => {
+                self.toast = Some(e);
+                Task::none()
+            }
+            Message::PairPoll => {
+                Task::perform(self.proc.clone().pair_state(), Message::PairStateLoaded)
+            }
+            Message::PairStateLoaded(s) => {
+                self.pairing = s;
+                Task::none()
+            }
+            Message::PairRespond(accept) => {
+                Task::perform(self.proc.clone().pair_respond(accept), |_| Message::PairPoll)
+            }
+            Message::PairClear => {
+                self.pairing = PairState::Idle;
+                // Clear the subprocess, then refresh the device list (a new
+                // device may have just landed in the trust store).
+                Task::batch([
+                    Task::perform(self.proc.clone().pair_clear(), |_| Message::PairPoll),
+                    Task::perform(ipc::request(UiRequest::Status), Message::StatusLoaded),
+                ])
             }
         }
     }
@@ -432,8 +498,80 @@ impl App {
             ].spacing(10).align_y(Alignment::Center));
         }
         col = col.push(horizontal_rule(1));
-        col = col.push(text("Pair a new device from the Connection tab.").size(12));
+        col = col.push(self.pairing_view());
         col.into()
+    }
+
+    fn pairing_view(&self) -> Element<'_, Message> {
+        let panel = match &self.pairing {
+            PairState::Idle => {
+                let wait = button("Wait for a peer")
+                    .on_press(Message::PairRoleListen(true))
+                    .style(if self.pair_listen { button::primary } else { button::secondary });
+                let connect = button("Connect to a peer")
+                    .on_press(Message::PairRoleListen(false))
+                    .style(if self.pair_listen { button::secondary } else { button::primary });
+                let mut c = column![
+                    text("Pair a new device").size(16),
+                    text("Confirm the same 6-digit code shows on both machines.").size(12),
+                    row![wait, connect].spacing(8),
+                ]
+                .spacing(8);
+                if !self.pair_listen {
+                    c = c.push(
+                        text_input("192.168.1.42:7345", &self.pair_addr)
+                            .on_input(Message::PairAddrChanged),
+                    );
+                }
+                if self.life.running {
+                    c = c.push(text("Stop the daemon first — pairing uses the same port.").size(12));
+                    c = c.push(button("Start pairing")); // disabled while the daemon runs
+                } else {
+                    c = c.push(button("Start pairing").on_press(Message::PairStart));
+                }
+                c
+            }
+            PairState::Waiting => column![
+                text("Pairing").size(16),
+                text("Waiting for a peer to connect…").size(14),
+                button("Cancel").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            PairState::Connecting => column![
+                text("Pairing").size(16),
+                text("Connecting…").size(14),
+                button("Cancel").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            PairState::Prompt { sas, peer } => column![
+                text(if peer.is_empty() {
+                    "Pair with this device?".to_string()
+                } else {
+                    format!("Pair with “{peer}”?")
+                })
+                .size(16),
+                text("Confirm this code matches on BOTH machines:").size(13),
+                text(sas.clone()).size(40),
+                text("If they differ, someone may be intercepting — don't continue.").size(12),
+                row![
+                    button("They don't match").on_press(Message::PairRespond(false)).style(button::danger),
+                    button("Confirm").on_press(Message::PairRespond(true)).style(button::primary),
+                ]
+                .spacing(8),
+            ]
+            .spacing(10),
+            PairState::Done { ok } => column![
+                text(if *ok { "Paired ✓" } else { "Pairing aborted" }).size(16),
+                button("Close").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+            PairState::Error(msg) => column![
+                text(format!("Pairing error: {msg}")).size(14),
+                button("Close").on_press(Message::PairClear),
+            ]
+            .spacing(8),
+        };
+        panel.into()
     }
 
     fn view_transfers(&self) -> Element<'_, Message> {
