@@ -46,6 +46,9 @@ pub enum UiEvent {
         device_name: String,
         peers: Vec<PeerStatus>,
         active: bool,
+        /// The daemon's actual bound QUIC listen port (0 if not yet bound).
+        #[serde(default)]
+        port: u16,
     },
     /// A pairing needs the user to compare codes.
     PairingPrompt { device_name: String, sas: String },
@@ -222,6 +225,7 @@ mod tests {
                 device_name: "test-device".into(),
                 peers: vec![PeerStatus { name: "peer".into(), connected: true, address: None, latency_ms: Some(7) }],
                 active: true,
+                port: 7345,
             }],
             _ => vec![],
         });
@@ -237,9 +241,10 @@ mod tests {
         let resp = request(&sock, &UiRequest::Status).await.unwrap();
         assert_eq!(resp.len(), 1);
         match &resp[0] {
-            UiEvent::Status { device_name, peers, active } => {
+            UiEvent::Status { device_name, peers, active, port } => {
                 assert_eq!(device_name, "test-device");
                 assert!(*active);
+                assert_eq!(*port, 7345);
                 assert_eq!(peers[0].latency_ms, Some(7));
             }
             other => panic!("expected Status, got {other:?}"),

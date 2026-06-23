@@ -40,12 +40,6 @@ enum Screen {
     Settings,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Role {
-    Server,
-    Client,
-}
-
 struct Features {
     input: bool,
     clipboard: bool,
@@ -60,12 +54,13 @@ struct App {
     device_name: String,
     peers: Vec<PeerStatus>,
     active: bool,
+    port: u16,
     transfers: Vec<(String, f32, u64)>,
 
     life: Lifecycle,
     bin: BinInfo,
-    run_role: Role,
-    run_addr: String,
+    manual_peer: String,
+    port_input: String,
     bin_input: String,
     features: Features,
     toast: Option<String>,
@@ -78,8 +73,8 @@ enum Message {
     StatusLoaded(Result<Vec<UiEvent>, String>),
     LifecycleLoaded(Lifecycle),
     BinLoaded(BinInfo),
-    RunRole(Role),
-    RunAddrChanged(String),
+    ManualPeerChanged(String),
+    PortChanged(String),
     BinInputChanged(String),
     StartDaemon,
     StopDaemon,
@@ -100,11 +95,12 @@ impl App {
             device_name: String::new(),
             peers: Vec::new(),
             active: false,
+            port: 0,
             transfers: Vec::new(),
             life: Lifecycle::default(),
             bin: BinInfo { path: None, source: "none", exists: false },
-            run_role: Role::Server,
-            run_addr: String::new(),
+            manual_peer: String::new(),
+            port_input: String::new(),
             bin_input: String::new(),
             features: Features { input: true, clipboard: true, audio: false },
             toast: None,
@@ -139,10 +135,11 @@ impl App {
                 self.transfers.clear();
                 for ev in &events {
                     match ev {
-                        UiEvent::Status { device_name, peers, active } => {
+                        UiEvent::Status { device_name, peers, active, port } => {
                             self.device_name = device_name.clone();
                             self.peers = peers.clone();
                             self.active = *active;
+                            self.port = *port;
                         }
                         UiEvent::TransferProgress { name, fraction, bytes_per_sec, .. } => {
                             self.transfers.push((name.clone(), *fraction, *bytes_per_sec));
@@ -171,12 +168,13 @@ impl App {
                 self.bin = b;
                 Task::none()
             }
-            Message::RunRole(r) => {
-                self.run_role = r;
+            Message::ManualPeerChanged(s) => {
+                self.manual_peer = s;
                 Task::none()
             }
-            Message::RunAddrChanged(s) => {
-                self.run_addr = s;
+            Message::PortChanged(s) => {
+                // Keep only digits so the field always parses as a port.
+                self.port_input = s.chars().filter(|c| c.is_ascii_digit()).collect();
                 Task::none()
             }
             Message::BinInputChanged(s) => {
@@ -184,8 +182,9 @@ impl App {
                 Task::none()
             }
             Message::StartDaemon => {
-                let connect = (self.run_role == Role::Client).then(|| self.run_addr.clone());
-                Task::perform(self.proc.clone().start(connect), Message::DaemonActed)
+                let connect = (!self.manual_peer.trim().is_empty()).then(|| self.manual_peer.clone());
+                let port = self.port_input.parse::<u16>().ok().filter(|p| *p != 0);
+                Task::perform(self.proc.clone().start(connect, port), Message::DaemonActed)
             }
             Message::StopDaemon => {
                 Task::perform(self.proc.clone().stop(), Message::DaemonActed)
@@ -195,7 +194,20 @@ impl App {
                     Ok(()) => "daemon updated".into(),
                     Err(e) => e,
                 });
-                Task::perform(self.proc.clone().lifecycle(), Message::LifecycleLoaded)
+                // Refresh now, then a couple of quick follow-ups so the running
+                // state + listening port appear within ~1s of the daemon binding,
+                // rather than waiting for the next steady (2s) poll.
+                Task::batch([
+                    Task::perform(self.proc.clone().lifecycle(), Message::LifecycleLoaded),
+                    Task::perform(
+                        async { tokio::time::sleep(Duration::from_millis(600)).await },
+                        |_| Message::Tick,
+                    ),
+                    Task::perform(
+                        async { tokio::time::sleep(Duration::from_millis(1500)).await },
+                        |_| Message::Tick,
+                    ),
+                ])
             }
             Message::SetBin => {
                 let p = Some(self.bin_input.clone());
@@ -319,38 +331,49 @@ impl App {
     }
 
     fn view_connection(&self) -> Element<'_, Message> {
-        // Daemon lifecycle.
-        let state = if self.life.running { "● running" } else { "○ stopped" };
-        let role_server = button("Server (listen / auto)")
-            .on_press(Message::RunRole(Role::Server))
-            .style(if self.run_role == Role::Server { button::primary } else { button::secondary });
-        let role_client = button("Client (connect to…)")
-            .on_press(Message::RunRole(Role::Client))
-            .style(if self.run_role == Role::Client { button::primary } else { button::secondary });
+        let running = self.life.running;
 
-        let mut daemon = column![
-            text("Daemon").size(18),
-            text(state).size(13),
-            text("Server listens + auto-discovers; Client also dials a known address.").size(12),
-            row![role_server, role_client].spacing(8),
-        ]
-        .spacing(8);
-        if self.run_role == Role::Client {
-            daemon = daemon.push(
-                text_input("192.168.1.42:7345", &self.run_addr).on_input(Message::RunAddrChanged),
-            );
-        }
-        let start = if self.life.running || !self.bin.exists {
+        // Daemon lifecycle. The daemon is symmetric: it listens AND auto-connects
+        // to paired peers found on the LAN via mDNS — no client/server split.
+        let state = if running {
+            if self.port != 0 {
+                format!("● running · listening on port {}", self.port)
+            } else {
+                "● running".to_string()
+            }
+        } else {
+            "○ stopped".to_string()
+        };
+        let start = if running || !self.bin.exists {
             button("Start daemon")
         } else {
             button("Start daemon").on_press(Message::StartDaemon)
         };
-        let stop = if self.life.running {
+        let stop = if running {
             button("Stop").on_press(Message::StopDaemon).style(button::danger)
         } else {
             button("Stop").style(button::danger)
         };
-        daemon = daemon.push(row![start, stop].spacing(8));
+
+        // Optional advanced fields, locked while running (they're start-time args).
+        let peer_field = text_input("auto-discovered via mDNS (optional)", &self.manual_peer);
+        let peer_field = if running { peer_field } else { peer_field.on_input(Message::ManualPeerChanged) };
+        let port_field = text_input("auto (optional)", &self.port_input);
+        let port_field = if running { port_field } else { port_field.on_input(Message::PortChanged) };
+
+        let daemon = column![
+            text("Daemon").size(18),
+            text(state).size(13),
+            text("Paired devices on the LAN connect automatically (mDNS). Both ends just run.").size(12),
+            row![start, stop].spacing(8),
+            Space::with_height(6),
+            text("Advanced").size(13),
+            row![text("Manual peer").width(Length::Fixed(110.0)), peer_field].spacing(8).align_y(Alignment::Center),
+            text("Only needed on networks without mDNS (host:port).").size(11),
+            row![text("Listen port").width(Length::Fixed(110.0)), port_field].spacing(8).align_y(Alignment::Center),
+            text("Leave empty for an OS-assigned port (advertised via mDNS).").size(11),
+        ]
+        .spacing(8);
 
         // Binary resolution.
         let bin_state = if self.bin.exists {

@@ -33,6 +33,8 @@ pub enum UiEvent {
         device_name: String,
         peers: Vec<PeerStatus>,
         active: bool,
+        #[serde(default)]
+        port: u16,
     },
     PairingPrompt {
         device_name: String,
@@ -66,16 +68,14 @@ pub struct PeerStatus {
     pub latency_ms: Option<u32>,
 }
 
-/// Resolve the daemon's control-socket path (mirrors
-/// `deskoryn_core::config::Paths::socket_file` — `<state_dir>/deskorynd.sock`),
-/// with a `DESKORYN_STATE_DIR` override.
+/// Resolve the daemon's control-socket path. Must match
+/// `deskoryn_core::config::Paths` exactly: `ProjectDirs::from("io","Deskoryn",
+/// "Deskoryn").data_dir()/deskorynd.sock`. (The daemon does **not** honor a
+/// state-dir env override, so neither do we.)
 pub fn socket_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("DESKORYN_STATE_DIR") {
-        return PathBuf::from(dir).join("deskorynd.sock");
-    }
-    directories::ProjectDirs::from("ch", "biceps", "deskoryn")
+    directories::ProjectDirs::from("io", "Deskoryn", "Deskoryn")
         .map(|p| p.data_dir().to_path_buf())
-        .unwrap_or_else(|| std::env::temp_dir().join("deskoryn"))
+        .unwrap_or_else(|| std::env::temp_dir().join("Deskoryn"))
         .join("deskorynd.sock")
 }
 

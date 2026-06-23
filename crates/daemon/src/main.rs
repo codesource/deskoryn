@@ -55,6 +55,10 @@ enum Cmd {
         /// "client" role that initiates to a known address. Repeatable.
         #[arg(long = "connect", value_name = "HOST:PORT")]
         connect: Vec<String>,
+        /// Override the QUIC listen port (default: config / OS-assigned, which is
+        /// advertised over mDNS). Use a fixed port for firewalled/static setups.
+        #[arg(long = "port", value_name = "PORT")]
+        port: Option<u16>,
     },
     /// Print resolved config + paths and exit.
     Info,
@@ -134,15 +138,19 @@ async fn main() -> anyhow::Result<()> {
     let hostname = hostname();
     let config = Arc::new(AppConfig::load_or_bootstrap(&config_path, hostname)?);
 
-    match cli.cmd.unwrap_or(Cmd::Run { dry_run: false, connect: Vec::new() }) {
-        Cmd::Run { dry_run, connect } => {
-            // "client" role: seed the dial loop with the given addresses on top
-            // of the configured static peers. Plain `run` stays symmetric.
-            let config = if connect.is_empty() {
+    match cli.cmd.unwrap_or(Cmd::Run { dry_run: false, connect: Vec::new(), port: None }) {
+        Cmd::Run { dry_run, connect, port } => {
+            // Apply optional overrides: `--connect` seeds the dial loop (client
+            // role) on top of configured static peers; `--port` fixes the listen
+            // port. Plain `run` stays symmetric with the configured values.
+            let config = if connect.is_empty() && port.is_none() {
                 config
             } else {
                 let mut c = (*config).clone();
                 c.network.static_peers.extend(connect);
+                if let Some(p) = port {
+                    c.network.listen_port = p;
+                }
                 Arc::new(c)
             };
             supervisor::run(config, paths, dry_run).await
@@ -183,9 +191,10 @@ async fn status_command(paths: &Paths) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("no running daemon at {} ({e})", socket.display()))?;
         for ev in events {
-            if let UiEvent::Status { device_name, peers, active } = ev {
+            if let UiEvent::Status { device_name, peers, active, port } = ev {
                 println!("device: {device_name}");
                 println!("active: {active}");
+                println!("port:   {port}");
                 if peers.is_empty() {
                     println!("peers:  (none paired)");
                 } else {

@@ -64,6 +64,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         use crate::ipc::{self, PeerStatus, UiEvent, UiRequest};
         let device_name = config.device.name.clone();
         let peer_names: Vec<String> = trust.lock().await.devices.iter().map(|d| d.name.clone()).collect();
+        let listen_port = endpoint.local_port();
         let socket = paths.socket_file();
         let handler: ipc::Handler = std::sync::Arc::new(move |req| match req {
             UiRequest::Status => vec![UiEvent::Status {
@@ -74,6 +75,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                     .map(|n| PeerStatus { name: n.clone(), connected: false, address: None, latency_ms: None })
                     .collect(),
                 active: false,
+                port: listen_port,
             }],
             _ => vec![],
         });

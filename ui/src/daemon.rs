@@ -40,7 +40,9 @@ struct UiSettings {
 }
 
 fn settings_file() -> Option<PathBuf> {
-    directories::ProjectDirs::from("ch", "biceps", "deskoryn")
+    // Same identifier as the daemon's `Paths` so the UI's settings live beside
+    // the daemon's config dir.
+    directories::ProjectDirs::from("io", "Deskoryn", "Deskoryn")
         .map(|p| p.config_dir().join("ui.json"))
 }
 
@@ -99,8 +101,14 @@ impl ProcMgr {
         }
     }
 
-    /// Start `deskorynd run [--connect <addr>]`. `connect` selects the client role.
-    pub async fn start(self: Arc<Self>, connect: Option<String>) -> Result<(), String> {
+    /// Start `deskorynd run [--connect <addr>] [--port <n>]`. A manual peer is an
+    /// optional dial target for LANs without mDNS; the port is an optional
+    /// listen-port override (default: OS-assigned, advertised via mDNS).
+    pub async fn start(
+        self: Arc<Self>,
+        connect: Option<String>,
+        port: Option<u16>,
+    ) -> Result<(), String> {
         {
             let mut run = self.run.lock().await;
             if let Some(child) = run.as_mut() {
@@ -114,6 +122,9 @@ impl ProcMgr {
         cmd.arg("run");
         if let Some(addr) = connect.as_ref().filter(|s| !s.trim().is_empty()) {
             cmd.arg("--connect").arg(addr.trim());
+        }
+        if let Some(p) = port {
+            cmd.arg("--port").arg(p.to_string());
         }
         cmd.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
