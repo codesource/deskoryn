@@ -39,6 +39,38 @@ pub async fn run(config: Arc<AppConfig>, paths: Paths, dry_run: bool) -> anyhow:
 /// Real, networked run: bind a QUIC endpoint, accept inbound sessions, and dial
 /// known peers with auto-reconnect. Requires the `linux`/`windows` feature
 /// (which enables `deskoryn-net/full`).
+/// Best-effort: register an inbound-UDP firewall allow rule for this exe so
+/// peers can dial us for pairing/sessions. Windows silently blocks inbound UDP
+/// for new apps (no prompt for UDP), which breaks pairing *into* this machine.
+/// Succeeds when run elevated; otherwise logs a clear hint (the proper fix is an
+/// installer-time rule). No-op on other platforms.
+#[cfg(windows)]
+fn ensure_firewall_rule() {
+    use std::process::Command;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let program = format!("program={}", exe.display());
+    // Replace any stale rule (path may have changed), then add for this exe.
+    let _ = Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", "name=Deskoryn"])
+        .output();
+    let res = Command::new("netsh")
+        .args([
+            "advfirewall", "firewall", "add", "rule", "name=Deskoryn",
+            "dir=in", "action=allow", "protocol=UDP", "profile=any", &program,
+        ])
+        .output();
+    match res {
+        Ok(o) if o.status.success() => {
+            tracing::info!("firewall: inbound UDP allowed for deskorynd")
+        }
+        Ok(o) => tracing::warn!(
+            detail = %String::from_utf8_lossy(&o.stderr).trim(),
+            "firewall rule not added — run the daemon once as Administrator (or add an inbound-UDP allow rule for deskorynd.exe) so peers can pair *to* this machine"
+        ),
+        Err(e) => tracing::warn!(error = %e, "could not run netsh to register a firewall rule"),
+    }
+}
+
 /// A peer last seen over mDNS.
 #[cfg(any(feature = "linux", feature = "windows"))]
 struct DiscEntry {
@@ -68,6 +100,11 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     let trust = Arc::new(Mutex::new(TrustStore::load(&paths.trust_file())?));
     let endpoint = Arc::new(QuicEndpoint::bind(config.network.listen_port, identity, trust.clone()).await?);
     tracing::info!(port = endpoint.local_port(), "QUIC endpoint bound");
+
+    // Windows blocks inbound UDP for new apps without a prompt; best-effort
+    // self-register a firewall rule so peers can pair *to* this machine.
+    #[cfg(windows)]
+    ensure_firewall_rule();
 
     // Pairing coordinator: shared by the IPC handler (open window / dial /
     // confirm) and the accept loop (route an untrusted peer into pairing).
