@@ -309,6 +309,12 @@ impl App {
                 Task::perform(ipc::request(UiRequest::PairStatus), Message::PairLoaded)
             }
             Message::PairLoaded(Ok(events)) => {
+                // Surface any warning (e.g. firewall blocking inbound) as a toast.
+                if let Some(UiEvent::Notice { text, .. }) =
+                    events.iter().find(|e| matches!(e, UiEvent::Notice { .. }))
+                {
+                    self.toast = Some(text.clone());
+                }
                 if let Some(UiEvent::Pairing { phase, sas, peer }) =
                     events.into_iter().find(|e| matches!(e, UiEvent::Pairing { .. }))
                 {

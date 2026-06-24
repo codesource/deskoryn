@@ -48,11 +48,23 @@ pub async fn run(config: Arc<AppConfig>, paths: Paths, dry_run: bool) -> anyhow:
 fn ensure_firewall_rule() {
     use std::process::Command;
     let Ok(exe) = std::env::current_exe() else { return };
+
+    // Already allowed? Querying needs no admin (unlike add/delete) and avoids
+    // churning the rule on every start. Key off the exit status, not the
+    // message text, which is localized.
+    let exists = Command::new("netsh")
+        .args(["advfirewall", "firewall", "show", "rule", "name=Deskoryn"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if exists {
+        tracing::debug!("firewall: Deskoryn inbound rule already present");
+        return;
+    }
+
+    // Missing — add it (needs admin). If the exe later moves, delete the old
+    // rule so this re-adds for the new path.
     let program = format!("program={}", exe.display());
-    // Replace any stale rule (path may have changed), then add for this exe.
-    let _ = Command::new("netsh")
-        .args(["advfirewall", "firewall", "delete", "rule", "name=Deskoryn"])
-        .output();
     let res = Command::new("netsh")
         .args([
             "advfirewall", "firewall", "add", "rule", "name=Deskoryn",
@@ -69,6 +81,30 @@ fn ensure_firewall_rule() {
         ),
         Err(e) => tracing::warn!(error = %e, "could not run netsh to register a firewall rule"),
     }
+}
+
+/// Proactive inbound-reachability check, run when the user opens the
+/// discoverable window. Windows only and precise: is our `netsh` allow rule
+/// present? (Linux can only tell whether a firewall is *active*, not whether the
+/// port is blocked — too false-positive-prone to warn on, so we rely on the
+/// reactive dial-failure hint there instead.)
+#[cfg(any(feature = "linux", feature = "windows"))]
+fn inbound_firewall_hint() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let allowed = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "show", "rule", "name=Deskoryn"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        return (!allowed).then(|| {
+            "Windows is blocking inbound connections — allow deskorynd through the firewall \
+             (run the daemon once as Administrator), or peers can't pair to this machine."
+                .to_string()
+        });
+    }
+    #[allow(unreachable_code)]
+    None
 }
 
 /// A peer last seen over mDNS.
@@ -215,8 +251,17 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                     UiRequest::Pair { addr } => {
                         if addr.trim().is_empty() {
                             // Open the discoverable window; the accept loop will
-                            // route the next untrusted peer into pairing.
+                            // route the next untrusted peer into pairing. Check
+                            // now whether inbound is likely blocked and warn.
                             pairing.set_discoverable(true).await;
+                            let mut events = vec![pairing_event(pairing.snapshot().await)];
+                            if let Some(text) = inbound_firewall_hint() {
+                                events.push(UiEvent::Notice {
+                                    level: crate::ipc::NoticeLevel::Warning,
+                                    text,
+                                });
+                            }
+                            return events;
                         } else {
                             // Dial the chosen peer and pair, on the live endpoint.
                             let addr = addr.trim().to_string();
@@ -236,7 +281,13 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                                 ).await;
                                             }
                                             Err(e) => {
-                                                pairing2.fail(format!("connect failed: {e}")).await;
+                                                // Reactive firewall hint: a failed
+                                                // dial is most often the peer being
+                                                // offline or blocking inbound.
+                                                pairing2.fail(format!(
+                                                    "couldn't reach {addr} — the other device may be offline or blocking inbound \
+                                                     (firewall). Make sure its daemon is running and inbound UDP is allowed. ({e})"
+                                                )).await;
                                             }
                                         }
                                     });
