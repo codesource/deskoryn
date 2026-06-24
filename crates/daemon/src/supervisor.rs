@@ -111,7 +111,8 @@ fn inbound_firewall_hint() -> Option<String> {
 #[cfg(any(feature = "linux", feature = "windows"))]
 struct DiscEntry {
     name: String,
-    addr: std::net::SocketAddr,
+    /// All advertised dialable addresses (best first).
+    addrs: Vec<std::net::SocketAddr>,
     pairing: bool,
     last_seen: std::time::Instant,
 }
@@ -232,7 +233,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                             })
                             .map(|(id, e)| DiscoveredPeer {
                                 name: e.name.clone(),
-                                addr: e.addr.to_string(),
+                                addr: e.addrs.first().map(|a| a.to_string()).unwrap_or_default(),
                                 device: id.short(),
                                 trusted: t.get(*id).is_some(),
                             })
@@ -265,31 +266,54 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         } else {
                             // Dial the chosen peer and pair, on the live endpoint.
                             let addr = addr.trim().to_string();
-                            match addr.parse() {
+                            match addr.parse::<std::net::SocketAddr>() {
                                 Ok(sock) => {
+                                    // If this is a discovered peer, try ALL of its
+                                    // advertised addresses (a stray APIPA/Docker
+                                    // address shouldn't be the only attempt).
+                                    let candidates: Vec<std::net::SocketAddr> = {
+                                        let d = discovered.lock().await;
+                                        d.values()
+                                            .find(|e| e.addrs.contains(&sock))
+                                            .map(|e| e.addrs.clone())
+                                            .unwrap_or_else(|| vec![sock])
+                                    };
                                     let pairing2 = pairing.clone();
                                     let config2 = config.clone();
                                     let trust2 = trust.clone();
                                     let paths2 = paths.clone();
                                     let endpoint2 = endpoint.clone();
                                     tokio::spawn(async move {
-                                        match endpoint2.connect_unverified(sock).await {
-                                            Ok(session) => {
-                                                let _ = crate::pairing::run_handshake(
-                                                    pairing2, session, true, Some(addr),
-                                                    config2, local_fp_ipc, trust2, paths2,
-                                                ).await;
-                                            }
-                                            Err(e) => {
-                                                // Reactive firewall hint: a failed
-                                                // dial is most often the peer being
-                                                // offline or blocking inbound.
-                                                pairing2.fail(format!(
-                                                    "couldn't reach {addr} — the other device may be offline or blocking inbound \
-                                                     (firewall). Make sure its daemon is running and inbound UDP is allowed. ({e})"
-                                                )).await;
+                                        let mut last_err = String::from("no address");
+                                        for cand in &candidates {
+                                            // Bound each attempt so an unreachable
+                                            // address fails fast and we try the next.
+                                            match tokio::time::timeout(
+                                                std::time::Duration::from_secs(5),
+                                                endpoint2.connect_unverified(*cand),
+                                            )
+                                            .await
+                                            {
+                                                Ok(Ok(session)) => {
+                                                    let _ = crate::pairing::run_handshake(
+                                                        pairing2.clone(), session, true,
+                                                        Some(cand.to_string()), config2.clone(),
+                                                        local_fp_ipc, trust2.clone(), paths2.clone(),
+                                                    )
+                                                    .await;
+                                                    return;
+                                                }
+                                                Ok(Err(e)) => last_err = e.to_string(),
+                                                Err(_) => last_err = "timed out".into(),
                                             }
                                         }
+                                        // Reactive firewall hint after all tries failed.
+                                        pairing2.fail(format!(
+                                            "couldn't reach {addr} — the other device may be offline or blocking inbound \
+                                             (firewall). Make sure its daemon is running and inbound UDP is allowed. \
+                                             (tried {} address(es); last: {last_err})",
+                                            candidates.len()
+                                        )).await;
                                     });
                                 }
                                 Err(e) => pairing.fail(format!("bad address: {e}")).await,
@@ -465,7 +489,7 @@ async fn start_discovery(
                     hint.device,
                     DiscEntry {
                         name: hint.name.clone(),
-                        addr: hint.addr,
+                        addrs: hint.addrs.clone(),
                         pairing: hint.pairing,
                         last_seen: std::time::Instant::now(),
                     },

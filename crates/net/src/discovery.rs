@@ -20,6 +20,10 @@ pub struct PeerHint {
     /// Advertised certificate fingerprint, if any. Lets us reject an imposter
     /// before opening a connection (it must still match the pinned value).
     pub fingerprint: Option<CertFingerprint>,
+    /// All advertised, *dialable* addresses (best first), to try in order — a
+    /// peer often advertises several (Wi-Fi, Ethernet, virtual). `addr` is the
+    /// first of these.
+    pub addrs: Vec<SocketAddr>,
     /// The peer is currently advertising that it's accepting pairing (its
     /// discoverable window is open). Drives the "nearby waiting to pair" list.
     pub pairing: bool,
@@ -159,31 +163,39 @@ pub mod mdns {
             .to_string();
         let fingerprint = info.get_property_val_str("fp").and_then(parse_fp);
         let pairing = info.get_property_val_str("pair").map(|s| s == "1").unwrap_or(false);
-        let ip = pick_address(info.get_addresses())?;
-        Some(PeerHint {
-            device,
-            name,
-            addr: SocketAddr::new(ip, info.get_port()),
-            fingerprint,
-            pairing,
-        })
+        let port = info.get_port();
+        let addrs: Vec<SocketAddr> = pick_addresses(info.get_addresses())
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect();
+        let addr = *addrs.first()?; // skip peers with no dialable address
+        Some(PeerHint { device, name, addr, addrs, fingerprint, pairing })
     }
 
-    /// Choose a dialable address from a peer's advertised set: prefer IPv4, then
-    /// a non-link-local IPv6. `fe80::/10` link-local needs a scope/zone id that
-    /// quinn rejects ("invalid remote address"), so skip it.
-    fn pick_address<'a>(addrs: impl IntoIterator<Item = &'a std::net::IpAddr>) -> Option<std::net::IpAddr> {
-        let addrs: Vec<std::net::IpAddr> = addrs.into_iter().copied().collect();
-        addrs
-            .iter()
-            .find(|a| a.is_ipv4())
-            .or_else(|| {
-                addrs.iter().find(|a| match a {
-                    std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
-                    std::net::IpAddr::V4(_) => false,
-                })
-            })
-            .copied()
+    /// Is this address worth trying to dial? Excludes loopback, unspecified,
+    /// IPv4 link-local/APIPA (`169.254/16`, assigned when DHCP fails — not
+    /// routable), and IPv6 link-local (`fe80::/10`, needs a scope id quinn won't
+    /// take).
+    fn is_dialable(ip: &std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        match ip {
+            IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+            IpAddr::V6(v6) => {
+                !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+            }
+        }
+    }
+
+    /// Dialable addresses from a peer's advertised set, best first (IPv4 before
+    /// IPv6). The caller tries them in order.
+    fn pick_addresses<'a>(
+        addrs: impl IntoIterator<Item = &'a std::net::IpAddr>,
+    ) -> Vec<std::net::IpAddr> {
+        let usable: Vec<std::net::IpAddr> =
+            addrs.into_iter().copied().filter(is_dialable).collect();
+        let mut ordered: Vec<std::net::IpAddr> = usable.iter().copied().filter(|a| a.is_ipv4()).collect();
+        ordered.extend(usable.iter().copied().filter(|a| a.is_ipv6()));
+        ordered
     }
 
     fn parse_fp(s: &str) -> Option<CertFingerprint> {
