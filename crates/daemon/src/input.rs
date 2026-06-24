@@ -17,7 +17,7 @@ use bytes::BytesMut;
 use deskoryn_core::config::InputConfig;
 use deskoryn_core::geometry::{Point, Rect};
 use deskoryn_core::input::{InputEvent, KeyCode, Modifiers};
-use deskoryn_core::{DeviceId, VirtualDesktop};
+use deskoryn_core::{DeviceId, Monitor, VirtualDesktop};
 use deskoryn_input::hotkey::Hotkey;
 use deskoryn_input::{Capture, Injector};
 use deskoryn_net::transport::{Session, Sink};
@@ -40,6 +40,10 @@ pub enum Action {
 /// local or crosses to (and is forwarded to) the peer.
 pub struct Controller {
     vd: VirtualDesktop,
+    /// This machine's monitors in *local OS* pixel coordinates (from detection),
+    /// used to warp the real cursor to the exact entry point. Keyed to `vd`
+    /// monitors by `MonitorId::index`.
+    local: Vec<Monitor>,
     me: DeviceId,
     pos: Point,
     /// True when the cursor is on a peer monitor and we are suppressing+forwarding.
@@ -66,6 +70,7 @@ impl Controller {
     pub fn new(vd: VirtualDesktop, me: DeviceId, start: Point) -> Self {
         Self {
             vd,
+            local: Vec::new(),
             me,
             pos: start,
             grabbed: false,
@@ -87,6 +92,41 @@ impl Controller {
         self.switch = Hotkey::parse(&cfg.switch_hotkey).ok();
         self.lock_key = Hotkey::parse(&cfg.lock_hotkey).ok();
         self
+    }
+
+    /// Provide this machine's monitors in local OS coordinates, so an incoming
+    /// `Enter` can warp the real cursor to the exact crossing point.
+    pub fn with_local_monitors(mut self, local: Vec<Monitor>) -> Self {
+        self.local = local;
+        self
+    }
+
+    /// Map a virtual-desktop entry point to a normalized absolute position
+    /// (`0..=65535` on each axis) over this machine's local virtual screen, so
+    /// the receiver can warp its cursor to exactly where the pointer crossed in.
+    ///
+    /// `None` when the point isn't on one of our monitors or local geometry is
+    /// unknown — the caller then falls back to relative motion only.
+    pub fn entry_norm(&self, entry: Point) -> Option<Point> {
+        // The virtual monitor (ours) the entry lands on, and the same physical
+        // monitor in local coordinates (matched by index).
+        let vm = self
+            .vd
+            .monitors
+            .iter()
+            .find(|m| m.device() == self.me && m.bounds.contains(entry))?;
+        let lm = self.local.iter().find(|m| m.id.index == vm.id.index)?;
+
+        // Position within the monitor (scaled if the arranged size differs).
+        let frac = |e: i32, vo: i32, vs: i32, lo: i32, ls: i32| -> i32 {
+            lo + ((e - vo) as i64 * ls as i64 / vs.max(1) as i64) as i32
+        };
+        let lx = frac(entry.x, vm.bounds.x, vm.bounds.w, lm.bounds.x, lm.bounds.w);
+        let ly = frac(entry.y, vm.bounds.y, vm.bounds.h, lm.bounds.y, lm.bounds.h);
+
+        // Normalize over our local virtual-screen bounding box.
+        let bbox = local_bbox(&self.local)?;
+        Some(Point::new(norm(lx - bbox.x, bbox.w), norm(ly - bbox.y, bbox.h)))
     }
 
     /// Whether the cursor is currently on a peer monitor (suppressing+forwarding).
@@ -285,6 +325,30 @@ impl Controller {
     }
 }
 
+/// Normalize `v` (a 0-based offset) into `0..=65535` over `span` pixels, the
+/// absolute-pointer convention used by both OS injectors.
+fn norm(v: i32, span: i32) -> i32 {
+    if span <= 1 {
+        0
+    } else {
+        ((v as i64 * 65535 / (span as i64 - 1)).clamp(0, 65535)) as i32
+    }
+}
+
+/// Bounding box of a set of monitors (in their own coordinate space).
+fn local_bbox(mons: &[Monitor]) -> Option<Rect> {
+    let mut it = mons.iter();
+    let first = it.next()?.bounds;
+    let (mut l, mut t, mut r, mut b) = (first.left(), first.top(), first.right(), first.bottom());
+    for m in it {
+        l = l.min(m.bounds.left());
+        t = t.min(m.bounds.top());
+        r = r.max(m.bounds.right());
+        b = b.max(m.bounds.bottom());
+    }
+    Some(Rect::new(l, t, r - l, b - t))
+}
+
 /// How far `p` lies outside `r`, as the larger of the two axis overshoots (0 if
 /// inside). Uses the half-open `[left,right)` convention of [`Rect::contains`].
 fn outside_distance(r: &Rect, p: Point) -> i32 {
@@ -351,7 +415,14 @@ pub async fn run_input(
                 let mut b = BytesMut::from(&frame[..]);
                 let Some(msg) = decode_one::<Input>(&mut b)? else { continue; };
                 match msg {
-                    Input::Enter { entry, .. } => injector.warp_to(entry).await?,
+                    Input::Enter { entry, .. } => {
+                        // Warp the real cursor to exactly where the pointer crossed
+                        // in (normalized absolute position); if we lack local
+                        // geometry, fall back to the forwarded relative motion.
+                        if let Some(at) = controller.entry_norm(entry) {
+                            injector.warp_to(at).await?;
+                        }
+                    }
                     Input::Leave => injector.release_all().await?,
                     Input::Events { seq, events } => {
                         for e in events {
@@ -383,6 +454,34 @@ mod tests {
 
     fn dev(b: u8) -> DeviceId {
         DeviceId::from_bytes([b; 16])
+    }
+
+    #[test]
+    fn entry_norm_maps_crossing_point_to_local_absolute() {
+        let me = dev(1);
+        let peer = dev(2);
+        let m = |d, i, x, y, w, h| Monitor {
+            id: MonitorId::new(d, i),
+            label: String::new(),
+            bounds: Rect::new(x, y, w, h),
+            native: Size::new(w, h),
+            scale_pct: 100,
+        };
+        // Our monitor is arranged at virtual x=5760 (right of the peer) but sits
+        // at local x=0; a single 1920x1080 display => local screen 1920x1080.
+        let vd = VirtualDesktop::new(vec![
+            m(peer, 0, 0, 0, 5760, 1080),
+            m(me, 0, 5760, 0, 1920, 1080),
+        ]);
+        let c = Controller::new(vd, me, Point::new(0, 0))
+            .with_local_monitors(vec![m(me, 0, 0, 0, 1920, 1080)]);
+
+        // Crossing in at the monitor's corners maps to the absolute extremes.
+        assert_eq!(c.entry_norm(Point::new(5760, 0)), Some(Point::new(0, 0)));
+        assert_eq!(c.entry_norm(Point::new(5760 + 1919, 0)), Some(Point::new(65535, 0)));
+        assert_eq!(c.entry_norm(Point::new(5760, 1079)), Some(Point::new(0, 65535)));
+        // A point on the peer's side isn't ours to warp to.
+        assert_eq!(c.entry_norm(Point::new(100, 100)), None);
     }
 
     fn two_machines() -> (DeviceId, DeviceId, VirtualDesktop) {
@@ -620,7 +719,15 @@ mod tests {
         let cap_a = Box::new(ScriptedCapture { events: script.into_iter() });
 
         let log = Arc::new(Mutex::new(Vec::new()));
-        let ctrl_b = Controller::new(vd, b, Point::new(2000, 500));
+        // B's monitor in local coordinates (so an Enter warps to the entry point).
+        let b_local = vec![Monitor {
+            id: MonitorId::new(b, 0),
+            label: "m0".into(),
+            bounds: Rect::new(0, 0, 1920, 1080),
+            native: Size::new(1920, 1080),
+            scale_pct: 100,
+        }];
+        let ctrl_b = Controller::new(vd, b, Point::new(2000, 500)).with_local_monitors(b_local);
         let inj_b = Box::new(RecordingInjector { log: log.clone() });
 
         // No live re-arrange in this test; hold the senders so the arms park.

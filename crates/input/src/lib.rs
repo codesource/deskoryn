@@ -57,8 +57,10 @@ pub trait Capture: Send {
 /// Injects synthetic input on the machine currently receiving control.
 #[async_trait]
 pub trait Injector: Send {
-    /// Warp the local cursor to a virtual-desktop point that maps onto a local
-    /// monitor (called on `Enter`).
+    /// Warp the local cursor to an absolute position, given as a normalized
+    /// `0..=65535` coordinate on each axis over this machine's virtual screen
+    /// (the daemon does the virtual→local mapping). Called on `Enter` so the
+    /// pointer appears exactly where it crossed in.
     async fn warp_to(&mut self, at: Point) -> Result<(), InputError>;
 
     async fn inject(&mut self, event: InputEvent) -> Result<(), InputError>;

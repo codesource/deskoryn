@@ -126,7 +126,10 @@ pub async fn run(
     // cursor on one of our own monitors.
     let start = start_position(&layout, config.device.id);
     let controller = crate::input::Controller::new(layout, config.device.id, start)
-        .with_input_config(&config.input);
+        .with_input_config(&config.input)
+        // Our detected monitors (local OS coords) let an incoming Enter warp the
+        // cursor to exactly where the pointer crossed in.
+        .with_local_monitors(own_monitors.clone());
     let capture = deskoryn_input::platform::open_capture()?;
     let injector = deskoryn_input::platform::open_injector()?;
     tracing::info!(backend = ?deskoryn_input::platform::detect(), "input backend");
