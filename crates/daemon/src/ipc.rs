@@ -227,7 +227,21 @@ pub async fn serve(path: PathBuf, handler: Handler) -> std::io::Result<()> {
 #[cfg(windows)]
 pub async fn request(path: &Path, req: &UiRequest) -> std::io::Result<Vec<UiEvent>> {
     use tokio::net::windows::named_pipe::ClientOptions;
-    let mut client = ClientOptions::new().open(pipe_name(path))?;
+    let name = pipe_name(path);
+    // Retry on ERROR_PIPE_BUSY (231): all instances busy, wait and retry.
+    let mut client = {
+        let mut tries = 0;
+        loop {
+            match ClientOptions::new().open(&name) {
+                Ok(c) => break c,
+                Err(e) if e.raw_os_error() == Some(231) && tries < 40 => {
+                    tries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    };
     write_msg(&mut client, req).await?;
     let mut out = Vec::new();
     while let Some(ev) = read_msg::<UiEvent, _>(&mut client).await? {

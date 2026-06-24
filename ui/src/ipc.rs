@@ -154,9 +154,23 @@ pub async fn request(req: UiRequest) -> Result<Vec<UiEvent>, String> {
             r"\\.\pipe\{}",
             path.file_name().and_then(|s| s.to_str()).unwrap_or("deskorynd.sock")
         );
-        let mut client = ClientOptions::new()
-            .open(&name)
-            .map_err(|e| format!("daemon not reachable ({e})"))?;
+        // ERROR_PIPE_BUSY (231): all server instances are busy; the canonical
+        // Windows behaviour is to wait briefly and retry (the daemon stands up a
+        // fresh instance after each accept).
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let mut client = {
+            let mut tries = 0;
+            loop {
+                match ClientOptions::new().open(&name) {
+                    Ok(c) => break c,
+                    Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && tries < 40 => {
+                        tries += 1;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => return Err(format!("daemon not reachable ({e})")),
+                }
+            }
+        };
         write_msg(&mut client, &req).await.map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         while let Some(ev) = read_msg::<UiEvent, _>(&mut client).await.map_err(|e| e.to_string())? {
