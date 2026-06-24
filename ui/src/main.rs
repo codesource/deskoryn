@@ -315,6 +315,27 @@ impl App {
                 if let Some(UiEvent::Pairing { phase, sas, peer }) =
                     events.into_iter().find(|e| matches!(e, UiEvent::Pairing { .. }))
                 {
+                    // Success is terminal: the daemon has already added the peer
+                    // to the trust store, so drop straight back to the idle
+                    // "Start pairing" view and refresh the device list - no
+                    // "Close" step for the user to dismiss.
+                    if phase == "paired" {
+                        self.pair_phase = "idle".into();
+                        self.pair_sas.clear();
+                        self.pair_peer.clear();
+                        if !peer.is_empty() {
+                            self.toast = Some(format!("Paired with {peer}"));
+                        }
+                        // Reset the daemon's terminal "done" snapshot too, then
+                        // refresh the (now larger) trusted-device list.
+                        return Task::batch([
+                            Task::perform(
+                                ipc::request(UiRequest::PairCancel),
+                                Message::PairLoaded,
+                            ),
+                            self.refresh(),
+                        ]);
+                    }
                     // Don't let a racy/stale "idle" snapshot (the dial reply can
                     // arrive before the handshake updates state) cancel an active
                     // flow - returning to idle is driven locally by PairClear.
@@ -643,11 +664,9 @@ impl App {
                 button("Cancel").on_press(Message::PairClear),
             ]
             .spacing(8),
-            "paired" => column![
-                text(format!("Paired with {}", self.pair_peer)).size(16),
-                button("Close").on_press(Message::PairClear),
-            ]
-            .spacing(8),
+            // "paired" is handled in `update`: on success we drop straight back
+            // to the idle view (the device is already trusted), so it never
+            // renders its own panel here.
             "aborted" => column![
                 text("Pairing aborted").size(16),
                 button("Close").on_press(Message::PairClear),
