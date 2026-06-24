@@ -136,8 +136,7 @@ mod linux {
     use deskoryn_core::geometry::Point;
     use deskoryn_core::input::{Button, InputEvent, KeyCode, Modifiers, ScrollAxis};
     use evdev::{
-        AbsInfo, AbsoluteAxisType, AttributeSet, EventType, InputEvent as EvEvent, InputEventKind,
-        Key, RelativeAxisType, UinputAbsSetup,
+        AttributeSet, EventType, InputEvent as EvEvent, InputEventKind, Key, RelativeAxisType,
     };
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Arc;
@@ -309,10 +308,6 @@ mod linux {
 
     pub struct UinputInjector {
         dev: evdev::uinput::VirtualDevice,
-        /// Separate absolute-pointer device used only to warp the cursor to an
-        /// entry point. `None` if it couldn't be created (warp degrades to relative
-        /// motion). Kept distinct from `dev` so normal relative motion is unaffected.
-        abs: Option<evdev::uinput::VirtualDevice>,
     }
 
     impl UinputInjector {
@@ -342,35 +337,8 @@ mod linux {
                 .map_err(io)?
                 .build()
                 .map_err(io)?;
-            let abs = build_abs_pointer().map_err(|e| {
-                tracing::warn!(error = %e, "absolute warp device unavailable; entry uses relative motion");
-                e
-            }).ok();
-            Ok(Self { dev, abs })
+            Ok(Self { dev })
         }
-    }
-
-    /// An absolute-pointer uinput device whose `0..=65535` axes map across the X
-    /// screen, so emitting `ABS_X/ABS_Y` warps the shared cursor to that fraction
-    /// of the virtual screen. A `BTN_LEFT` capability marks it as a pointer so the
-    /// X server tracks it (rather than treating it as a tablet needing a tool).
-    fn build_abs_pointer() -> Result<evdev::uinput::VirtualDevice, InputError> {
-        let mut keys = AttributeSet::<Key>::new();
-        keys.insert(Key::BTN_LEFT);
-        let info = AbsInfo::new(0, 0, 65535, 0, 0, 0);
-        let x = UinputAbsSetup::new(AbsoluteAxisType::ABS_X, info);
-        let y = UinputAbsSetup::new(AbsoluteAxisType::ABS_Y, info);
-        evdev::uinput::VirtualDeviceBuilder::new()
-            .map_err(io)?
-            .name("Deskoryn Virtual Pointer")
-            .with_keys(&keys)
-            .map_err(io)?
-            .with_absolute_axis(&x)
-            .map_err(io)?
-            .with_absolute_axis(&y)
-            .map_err(io)?
-            .build()
-            .map_err(io)
     }
 
     fn to_evdev(event: &InputEvent) -> Vec<EvEvent> {
@@ -410,17 +378,12 @@ mod linux {
 
     #[async_trait]
     impl Injector for UinputInjector {
-        async fn warp_to(&mut self, at: Point) -> Result<(), InputError> {
-            // `at` is normalized 0..=65535 over the virtual screen, matching the
-            // absolute device's axis range, so the X server places the cursor at
-            // that fraction of the screen. No-op if the abs device is absent.
-            if let Some(abs) = &mut self.abs {
-                let evs = [
-                    EvEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, at.x),
-                    EvEvent::new(EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, at.y),
-                ];
-                abs.emit(&evs).map_err(io)?; // emit() appends SYN_REPORT
-            }
+        async fn warp_to(&mut self, _at: Point) -> Result<(), InputError> {
+            // No-op for now: a relative uinput device can't warp, and a separate
+            // absolute uinput device gets misclassified by libinput (it synthesized
+            // phantom button events). Exact entry on Linux needs a libinput-safe
+            // path (e.g. XTest on X11); until then the cursor reaches the entry
+            // point via the forwarded relative motion.
             Ok(())
         }
         async fn inject(&mut self, event: InputEvent) -> Result<(), InputError> {
