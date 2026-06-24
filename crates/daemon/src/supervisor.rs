@@ -428,6 +428,8 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                     let trust2 = trust.clone();
                                     let paths2 = paths.clone();
                                     let endpoint2 = endpoint.clone();
+                                    let registry2 = registry.clone();
+                                    let layouts2 = layouts.clone();
                                     tokio::spawn(async move {
                                         let mut last_err = String::from("no address");
                                         for cand in &candidates {
@@ -440,12 +442,24 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                             .await
                                             {
                                                 Ok(Ok(session)) => {
+                                                    let addr = cand.to_string();
                                                     let _ = crate::pairing::run_handshake(
                                                         pairing2.clone(), session, true,
-                                                        Some(cand.to_string()), config2.clone(),
+                                                        Some(addr.clone()), config2.clone(),
                                                         local_fp_ipc, trust2.clone(), paths2.clone(),
                                                     )
                                                     .await;
+                                                    // On success, dial a real session right away so the
+                                                    // two daemons connect now (not only after a restart).
+                                                    if matches!(
+                                                        pairing2.snapshot().await,
+                                                        crate::pairing::PairState::Done { ok: true, .. }
+                                                    ) {
+                                                        spawn_peer_dial(
+                                                            endpoint2.clone(), addr, config2.clone(),
+                                                            registry2.clone(), layouts2.clone(),
+                                                        );
+                                                    }
                                                     return;
                                                 }
                                                 Ok(Err(e)) => last_err = e.to_string(),
@@ -569,36 +583,49 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     addrs.dedup();
 
     for addr_str in addrs {
-        let endpoint = endpoint.clone();
-        let config = config.clone();
-        let registry = registry.clone();
-        let layouts = layouts.clone();
-        tokio::spawn(async move {
-            let mut backoff = Backoff::default();
-            loop {
-                match addr_str.parse() {
-                    Ok(addr) => match endpoint.connect_any(addr).await {
-                        Ok(session) => {
-                            backoff = Backoff::default();
-                            if let Err(e) = crate::session::run(config.clone(), session, registry.clone(), layouts.clone()).await {
-                                tracing::warn!(error = %e, peer = %addr_str, "session ended");
-                            }
-                        }
-                        Err(e) => tracing::debug!(error = %e, peer = %addr_str, "dial failed"),
-                    },
-                    Err(e) => {
-                        tracing::error!(error = %e, "invalid peer address: {addr_str}");
-                        return;
-                    }
-                }
-                tokio::time::sleep(backoff.next()).await;
-            }
-        });
+        spawn_peer_dial(endpoint.clone(), addr_str, config.clone(), registry.clone(), layouts.clone());
     }
 
     // The spawned loops do the work; park until shutdown.
     std::future::pending::<()>().await;
     Ok(())
+}
+
+/// Spawn a reconnecting dial task to one peer address: connect, run the session,
+/// and re-dial with backoff whenever it drops. Used for known peers at startup
+/// and, crucially, right after a successful pairing so the two daemons connect
+/// immediately instead of only after a restart.
+#[cfg(any(feature = "linux", feature = "windows"))]
+fn spawn_peer_dial(
+    endpoint: Arc<deskoryn_net::quic::QuicEndpoint>,
+    addr_str: String,
+    config: Arc<AppConfig>,
+    registry: crate::session::ConnRegistry,
+    layouts: crate::session::LayoutStore,
+) {
+    tokio::spawn(async move {
+        let mut backoff = Backoff::default();
+        loop {
+            match addr_str.parse() {
+                Ok(addr) => match endpoint.connect_any(addr).await {
+                    Ok(session) => {
+                        backoff = Backoff::default();
+                        if let Err(e) =
+                            crate::session::run(config.clone(), session, registry.clone(), layouts.clone()).await
+                        {
+                            tracing::warn!(error = %e, peer = %addr_str, "session ended");
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, peer = %addr_str, "dial failed"),
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "invalid peer address: {addr_str}");
+                    return;
+                }
+            }
+            tokio::time::sleep(backoff.next()).await;
+        }
+    });
 }
 
 /// Start mDNS: advertise this device and dial discovered, **already-trusted**
