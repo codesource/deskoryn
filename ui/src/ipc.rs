@@ -18,7 +18,10 @@ pub enum UiRequest {
     PairCancel,
     DiscoveredPeers,
     Forget { device: String },
-    SetLayout { layout: serde_json::Value },
+    /// Fetch the arrangement (own + peer monitors + saved layout) for one peer.
+    Arrangement { peer: String },
+    /// Push an edited combined layout for one peer.
+    SetLayout { peer: String, layout: serde_json::Value },
     SetFeature { feature: Feature, enabled: bool },
 }
 
@@ -35,12 +38,22 @@ pub enum Feature {
 pub enum UiEvent {
     Status {
         device_name: String,
+        #[serde(default)]
+        device_id: String,
         peers: Vec<PeerStatus>,
         active: bool,
         #[serde(default)]
         port: u16,
         #[serde(default)]
         addrs: Vec<String>,
+        #[serde(default)]
+        monitors: Vec<MonitorView>,
+    },
+    Arrangement {
+        peer: String,
+        own: Vec<MonitorView>,
+        theirs: Vec<MonitorView>,
+        layout: serde_json::Value,
     },
     Pairing {
         phase: String,
@@ -81,9 +94,23 @@ pub struct DiscoveredPeer {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub name: String,
+    #[serde(default)]
+    pub device: String,
     pub connected: bool,
     pub address: Option<String>,
     pub latency_ms: Option<u32>,
+}
+
+/// One monitor as the arranger sees it: `dev` 0 = this machine, 1 = the peer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MonitorView {
+    pub dev: u8,
+    pub index: u16,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
 /// Resolve the daemon's control-socket path. Must match

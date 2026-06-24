@@ -1,13 +1,12 @@
 //! The monitor arranger: a draggable-tile canvas where every monitor of both
 //! machines is a tile in one shared virtual-desktop space. Drag a tile and its
 //! edges snap to its neighbours; "Apply" serializes the arrangement into a
-//! `VirtualDesktop` and pushes it with `SetLayout`.
+//! `VirtualDesktop` and pushes it with `SetLayout { peer }`.
 //!
-//! PROTOCOL GAP (same as the daemon notes): `Status` reports peer *names* but
-//! neither device ids nor the current `VirtualDesktop`, so this edits a working
-//! model seeded from the bring-up rig and pushes with placeholder device ids;
-//! it can't read the live layout back yet. The serialization already matches the
-//! wire shape, so only the read path is missing.
+//! The working model is built from the daemon's `Arrangement` reply for the
+//! selected peer ([`tiles_from_layout`]) — real monitors with resolutions, and
+//! the saved-or-seeded placement. With no peer connected, the solo view shows
+//! this device's own monitors read-only ([`tiles_from_views`]).
 
 use crate::Message;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Stroke, Text};
@@ -26,33 +25,76 @@ pub struct MonTile {
     pub h: i32,
 }
 
-/// Seed model: three 1080p displays on this machine, two 1440p on the peer to
-/// their right - the bring-up rig.
-pub fn starter() -> Vec<MonTile> {
-    let mut v = Vec::new();
-    for i in 0..3 {
-        v.push(MonTile {
-            dev: 0,
-            index: i,
-            label: format!("Linux-{}", ["L", "C", "R"][i as usize]),
-            x: i as i32 * 1920,
-            y: 0,
-            w: 1920,
-            h: 1080,
-        });
+/// Build editable tiles from a combined layout (the daemon's `Arrangement`
+/// reply). `own_device` is this machine's device id in hex, used to colour each
+/// monitor as local (`dev = 0`) or peer (`dev = 1`).
+pub fn tiles_from_layout(layout: &serde_json::Value, own_device: &str) -> Vec<MonTile> {
+    let Some(mons) = layout.get("monitors").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    mons.iter()
+        .map(|m| {
+            let id = m.get("id");
+            let dev_hex = id
+                .and_then(|i| i.get("device"))
+                .map(device_hex)
+                .unwrap_or_default();
+            let index = id.and_then(|i| i.get("index")).and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+            let label = m.get("label").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+            let b = m.get("bounds");
+            let g = |k: &str| b.and_then(|b| b.get(k)).and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            MonTile {
+                dev: if dev_hex == own_device { 0 } else { 1 },
+                index,
+                label,
+                x: g("x"),
+                y: g("y"),
+                w: g("w"),
+                h: g("h"),
+            }
+        })
+        .collect()
+}
+
+/// Build read-only tiles from a flat monitor list (used for the solo view, where
+/// only this device's monitors are shown).
+pub fn tiles_from_views(views: &[crate::ipc::MonitorView]) -> Vec<MonTile> {
+    views
+        .iter()
+        .map(|v| MonTile {
+            dev: v.dev,
+            index: v.index,
+            label: v.label.clone(),
+            x: v.x,
+            y: v.y,
+            w: v.w,
+            h: v.h,
+        })
+        .collect()
+}
+
+/// Hex string for a serialized `DeviceId` (a JSON array of 16 byte values).
+fn device_hex(device: &serde_json::Value) -> String {
+    device
+        .as_array()
+        .map(|a| a.iter().map(|n| format!("{:02x}", n.as_u64().unwrap_or(0) as u8)).collect())
+        .unwrap_or_default()
+}
+
+/// Parse a 32-char hex device id into its 16 bytes (zero-padded on error).
+fn hex_to_bytes16(hex: &str) -> Vec<u8> {
+    let b = hex.as_bytes();
+    let mut out = Vec::with_capacity(16);
+    let mut i = 0;
+    while i + 1 < b.len() && out.len() < 16 {
+        match ((b[i] as char).to_digit(16), (b[i + 1] as char).to_digit(16)) {
+            (Some(h), Some(l)) => out.push((h * 16 + l) as u8),
+            _ => break,
+        }
+        i += 2;
     }
-    for i in 0..2 {
-        v.push(MonTile {
-            dev: 1,
-            index: i,
-            label: format!("Win-{}", ["L", "R"][i as usize]),
-            x: 5760 + i as i32 * 2560,
-            y: 0,
-            w: 2560,
-            h: 1440,
-        });
-    }
-    v
+    out.resize(16, 0);
+    out
 }
 
 const SNAP: i32 = 60; // virtual px within which edges snap together
@@ -95,12 +137,13 @@ pub fn snap(idx: usize, mut x: i32, mut y: i32, tiles: &[MonTile]) -> (i32, i32)
 }
 
 /// Serialize the working model into the `deskoryn_core::VirtualDesktop` JSON
-/// shape the daemon deserializes (placeholder device ids - see the gap above).
-pub fn to_virtual_desktop(tiles: &[MonTile]) -> serde_json::Value {
+/// shape the daemon deserializes, stamping each monitor with the **real** device
+/// id (own vs the selected peer) so the daemon's focus logic can tell sides apart.
+pub fn to_virtual_desktop(tiles: &[MonTile], own_device: &str, peer_device: &str) -> serde_json::Value {
     let monitors: Vec<_> = tiles
         .iter()
         .map(|m| {
-            let dev: Vec<u8> = vec![if m.dev == 0 { 0 } else { 1 }; 16];
+            let dev = hex_to_bytes16(if m.dev == 0 { own_device } else { peer_device });
             serde_json::json!({
                 "id": { "device": dev, "index": m.index },
                 "label": m.label,
@@ -122,6 +165,8 @@ pub struct DragState {
 /// The canvas program; borrows the app's tiles for drawing/hit-testing.
 pub struct Arranger<'a> {
     pub tiles: &'a [MonTile],
+    /// When false (no peer connected), tiles are display-only: drags are ignored.
+    pub editable: bool,
 }
 
 impl Arranger<'_> {
@@ -152,6 +197,9 @@ impl canvas::Program<Message> for Arranger<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
+        if !self.editable {
+            return (canvas::event::Status::Ignored, None);
+        }
         let Some(pos) = cursor.position_in(bounds) else {
             // Cursor left the canvas: drop any drag.
             if matches!(event, canvas::Event::Mouse(mouse::Event::ButtonReleased(_))) {

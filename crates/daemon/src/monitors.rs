@@ -11,6 +11,30 @@
 //! and Windows (`EnumDisplayMonitors`) are future backends — `detect` returns a
 //! clear error there so the user falls back to `arrange add`.
 
+/// Detect this machine's monitors as virtual-desktop [`Monitor`]s owned by
+/// `device`, ready to drop into a [`VirtualDesktop`] / `Hello`. Bounds are the
+/// OS framebuffer coordinates as detected (the arranger places them relative to
+/// the peer); `native` is the same pixel size and `scale_pct` defaults to 100.
+///
+/// [`Monitor`]: deskoryn_core::layout::Monitor
+/// [`VirtualDesktop`]: deskoryn_core::VirtualDesktop
+pub fn detect_monitors(device: deskoryn_core::DeviceId) -> anyhow::Result<Vec<deskoryn_core::layout::Monitor>> {
+    use deskoryn_core::geometry::{Rect, Size};
+    use deskoryn_core::ids::MonitorId;
+    use deskoryn_core::layout::Monitor;
+    Ok(detect()?
+        .into_iter()
+        .enumerate()
+        .map(|(i, m)| Monitor {
+            id: MonitorId::new(device, i as u16),
+            label: m.name,
+            bounds: Rect::new(m.x, m.y, m.w, m.h),
+            native: Size { w: m.w, h: m.h },
+            scale_pct: 100,
+        })
+        .collect())
+}
+
 /// One detected monitor in the OS's framebuffer-pixel coordinate space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitorInfo {

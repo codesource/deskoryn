@@ -10,16 +10,71 @@
 //!   by config / UI in later milestones.
 
 use deskoryn_core::config::AppConfig;
+use deskoryn_core::layout::{Monitor, VirtualDesktop};
+use deskoryn_core::DeviceId;
 use deskoryn_net::transport::Session;
 use deskoryn_proto::{Channel, Control, PROTOCOL_VERSION};
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
-pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::Result<()> {
+/// Live info about one connected peer, shared with the IPC/arranger so the UI can
+/// show the peer's real monitors and push a new arrangement to the live session.
+pub struct ConnInfo {
+    /// The peer's monitors (in their own OS coordinates), from their `Hello`.
+    pub monitors: Vec<Monitor>,
+    /// Push a re-arranged combined layout to this session's input pump.
+    pub layout_tx: mpsc::Sender<VirtualDesktop>,
+}
+
+/// Currently-connected peers, keyed by device id. Empty ⇒ no peer connected
+/// (the arranger is disabled and shows only this device's monitors).
+pub type ConnRegistry = Arc<Mutex<HashMap<DeviceId, ConnInfo>>>;
+
+/// Saved per-peer combined arrangements, loaded from config at startup and
+/// persisted back on `SetLayout`. Read at connect time to restore the layout.
+pub type LayoutStore = Arc<Mutex<HashMap<DeviceId, VirtualDesktop>>>;
+
+/// Auto-place the peer's monitors immediately to the right of ours, producing a
+/// combined desktop to edit when there is no saved arrangement for this peer yet.
+pub fn seed_layout(own: &[Monitor], peer: &[Monitor]) -> VirtualDesktop {
+    let mut monitors = own.to_vec();
+    let right = own.iter().map(|m| m.bounds.right()).max().unwrap_or(0);
+    let peer_left = peer.iter().map(|m| m.bounds.left()).min().unwrap_or(0);
+    let shift = right - peer_left;
+    for m in peer {
+        let mut m = m.clone();
+        m.bounds.x += shift;
+        monitors.push(m);
+    }
+    VirtualDesktop::new(monitors)
+}
+
+pub async fn run(
+    config: Arc<AppConfig>,
+    session: Box<dyn Session>,
+    registry: ConnRegistry,
+    layouts: LayoutStore,
+) -> anyhow::Result<()> {
     // Shared so the clipboard pump can open the FileXfer channel for file-paste
     // while the input pump keeps using the same session.
     let session: Arc<dyn Session> = Arc::from(session);
     let peer = session.peer();
     tracing::info!(%peer, "session established");
+
+    // This device's monitors, freshly detected (with resolutions), to advertise
+    // in our Hello. Fall back to whatever the config recorded for us if the OS
+    // can't be queried (e.g. a Wayland session without a backend).
+    let own_monitors = crate::monitors::detect_monitors(config.device.id).unwrap_or_else(|e| {
+        tracing::debug!(error = %e, "monitor auto-detect unavailable; using configured monitors");
+        config
+            .layout
+            .monitors
+            .iter()
+            .filter(|m| m.device() == config.device.id)
+            .cloned()
+            .collect()
+    });
 
     // --- Handshake on the Control channel -----------------------------------
     let (mut ctl_tx, mut ctl_rx) = session.channel(Channel::Control).await?;
@@ -28,25 +83,40 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
         version: PROTOCOL_VERSION,
         device: config.device.id,
         name: config.device.name.clone(),
-        monitors: config.layout.clone(),
+        monitors: VirtualDesktop::new(own_monitors.clone()),
         capabilities: capabilities_from(&config),
     };
     deskoryn_proto::encode(&hello, &mut buf)?;
     ctl_tx.send_bytes(&buf).await?;
 
-    // Read the peer's Hello and merge layouts.
-    let mut layout = config.layout.clone();
+    // Read the peer's Hello: capture their monitors and audio capability.
+    let mut peer_monitors: Vec<Monitor> = Vec::new();
     let mut peer_forwards_audio = false;
     if let Some(frame) = ctl_rx.recv_bytes().await? {
         let mut b = bytes::BytesMut::from(&frame[..]);
         if let Some(Control::Hello { name, monitors, version, capabilities, .. }) =
             deskoryn_proto::decode_one::<Control>(&mut b)?
         {
-            tracing::info!(peer_name = %name, ?version, "peer hello");
-            // The combined virtual desktop is the union of both monitor sets.
-            layout.monitors.extend(monitors.monitors);
+            tracing::info!(peer_name = %name, ?version, monitors = monitors.monitors.len(), "peer hello");
+            peer_monitors = monitors.monitors;
             peer_forwards_audio = capabilities.audio_forward;
         }
+    }
+
+    // The combined desktop: the user's saved arrangement for this peer if any,
+    // else auto-place the peer to the right of us.
+    let layout = {
+        let store = layouts.lock().await;
+        store.get(&peer).cloned()
+    }
+    .unwrap_or_else(|| seed_layout(&own_monitors, &peer_monitors));
+
+    // Register this connection so the arranger can show the peer's monitors and
+    // push a re-arranged layout back to this session.
+    let (layout_tx, layout_rx) = mpsc::channel::<VirtualDesktop>(4);
+    {
+        let mut reg = registry.lock().await;
+        reg.insert(peer, ConnInfo { monitors: peer_monitors.clone(), layout_tx });
     }
 
     // Build the input controller over the combined virtual desktop, starting the
@@ -65,7 +135,7 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
     // ends first tears the session down so the supervisor can reconnect.
     tracing::info!(%peer, "session ready; starting pumps");
     let control = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default());
-    let input = crate::input::run_input(session.as_ref(), controller, capture, injector);
+    let input = crate::input::run_input(session.as_ref(), controller, capture, injector, layout_rx);
 
     // Clipboard sync (text + images on the Clipboard channel; files stream over
     // dedicated streams). Skipped entirely when all clipboard sync is disabled;
@@ -124,13 +194,19 @@ pub async fn run(config: Arc<AppConfig>, session: Box<dyn Session>) -> anyhow::R
         peer_forwards_audio,
     ));
 
-    let end = tokio::select! {
+    let result = tokio::select! {
         r = control => { r.map(|e| format!("{e:?}")) }
         r = input => { r.map(|_| "input pump ended".to_string()) }
         r = clipboard => { r.map(|_| "clipboard pump ended".to_string()) }
         r = dispatcher => { r.map(|_| "stream dispatcher ended".to_string()) }
         r = audio => { r.map(|_| "audio pump ended".to_string()) }
-    }?;
+    };
+
+    // Drop this peer from the live registry however the session ends, so the
+    // arranger reflects the disconnect (and falls back to own-monitors-only).
+    registry.lock().await.remove(&peer);
+
+    let end = result?;
     tracing::info!(%peer, %end, "session ended");
     Ok(())
 }

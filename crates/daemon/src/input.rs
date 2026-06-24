@@ -188,6 +188,22 @@ impl Controller {
         }
     }
 
+    /// Swap in a re-arranged virtual desktop (e.g. the user dragged a monitor in
+    /// the arranger and hit Apply). The cursor keeps its position when it still
+    /// lands on a monitor; otherwise we drop any active grab and re-center on one
+    /// of our own monitors so it can never get stranded off the new desktop.
+    pub fn set_layout(&mut self, vd: VirtualDesktop) {
+        let still_valid = vd.monitor_at(self.pos).is_some();
+        self.vd = vd;
+        if !still_valid {
+            self.grabbed = false;
+            self.edge_accum = 0;
+            if let Some(c) = self.monitor_center(false) {
+                self.pos = c;
+            }
+        }
+    }
+
     /// Center of the first monitor owned by the peer (`peer = true`) or by us.
     fn monitor_center(&self, peer: bool) -> Option<Point> {
         self.vd
@@ -284,12 +300,26 @@ pub async fn run_input(
     mut controller: Controller,
     mut capture: Box<dyn Capture>,
     mut injector: Box<dyn Injector>,
+    mut layout_rx: tokio::sync::mpsc::Receiver<VirtualDesktop>,
 ) -> anyhow::Result<()> {
     let (mut sink, mut source) = session.channel(Channel::Input).await?;
     let mut seq: u32 = 0;
+    // Once all senders drop (the arranger handler is gone), park this arm so the
+    // closed channel doesn't spin the select loop on an immediate `None`.
+    let mut layout_open = true;
 
     loop {
         tokio::select! {
+            // Live re-arrange: the arranger pushed a new layout via SetLayout.
+            maybe = async { layout_rx.recv().await }, if layout_open => {
+                match maybe {
+                    Some(vd) => {
+                        tracing::info!(monitors = vd.monitors.len(), "applying re-arranged layout");
+                        controller.set_layout(vd);
+                    }
+                    None => layout_open = false,
+                }
+            }
             ev = capture.next_event() => {
                 let ev = ev?;
                 for action in controller.on_event(ev) {
@@ -593,11 +623,14 @@ mod tests {
         let ctrl_b = Controller::new(vd, b, Point::new(2000, 500));
         let inj_b = Box::new(RecordingInjector { log: log.clone() });
 
+        // No live re-arrange in this test; hold the senders so the arms park.
+        let (_tx_a, rx_a) = tokio::sync::mpsc::channel(1);
+        let (_tx_b, rx_b) = tokio::sync::mpsc::channel(1);
         let pa = tokio::spawn(async move {
-            run_input(sa.as_ref(), ctrl_a, cap_a, Box::new(NullInjector)).await
+            run_input(sa.as_ref(), ctrl_a, cap_a, Box::new(NullInjector), rx_a).await
         });
         let pb = tokio::spawn(async move {
-            run_input(sb.as_ref(), ctrl_b, Box::new(IdleCapture), inj_b).await
+            run_input(sb.as_ref(), ctrl_b, Box::new(IdleCapture), inj_b, rx_b).await
         });
 
         // Wait until B has recorded the warp, both key events, and the release.

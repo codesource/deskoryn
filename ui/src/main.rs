@@ -22,7 +22,7 @@ use iced::widget::{
     Canvas, Space,
 };
 use iced::{Alignment, Element, Length, Subscription, Task, Theme};
-use ipc::{DiscoveredPeer, Feature, PeerStatus, UiEvent, UiRequest};
+use ipc::{DiscoveredPeer, Feature, MonitorView, PeerStatus, UiEvent, UiRequest};
 
 pub fn main() -> iced::Result {
     iced::application("Deskoryn", App::update, App::view)
@@ -54,7 +54,9 @@ struct App {
 
     reachable: bool,
     device_name: String,
+    device_id: String, // this device's id (hex), to stamp own monitors on Apply
     peers: Vec<PeerStatus>,
+    own_monitors: Vec<MonitorView>, // this device's detected monitors (solo view)
     active: bool,
     port: u16,
     local_addrs: Vec<String>, // this device's own dialable ip:port (for the manual fallback)
@@ -77,6 +79,7 @@ struct App {
 
     // Monitor arranger
     arrangement: Vec<MonTile>,
+    selected_peer: Option<String>, // device id (hex) of the peer being arranged
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +114,8 @@ enum Message {
     ArrAlignTops,
     ArrRevert,
     ArrApply,
+    ArrSelectPeer(String),
+    ArrLoaded(Result<Vec<UiEvent>, String>),
 }
 
 impl App {
@@ -120,7 +125,9 @@ impl App {
             proc: Arc::new(ProcMgr::default()),
             reachable: false,
             device_name: String::new(),
+            device_id: String::new(),
             peers: Vec::new(),
+            own_monitors: Vec::new(),
             active: false,
             port: 0,
             local_addrs: Vec::new(),
@@ -137,7 +144,8 @@ impl App {
             pair_peer: String::new(),
             pair_addr: String::new(),
             nearby: Vec::new(),
-            arrangement: arranger::starter(),
+            arrangement: Vec::new(),
+            selected_peer: None,
         };
         let proc = app.proc.clone();
         // Load the persisted binary override, then do a first refresh.
@@ -172,6 +180,9 @@ impl App {
         match message {
             Message::Nav(s) => {
                 self.screen = s;
+                if self.screen == Screen::Arranger {
+                    return self.load_arrangement();
+                }
                 Task::none()
             }
             Message::Tick => self.refresh(),
@@ -180,9 +191,11 @@ impl App {
                 self.transfers.clear();
                 for ev in &events {
                     match ev {
-                        UiEvent::Status { device_name, peers, active, port, addrs } => {
+                        UiEvent::Status { device_name, device_id, peers, active, port, addrs, monitors } => {
                             self.device_name = device_name.clone();
+                            self.device_id = device_id.clone();
                             self.peers = peers.clone();
+                            self.own_monitors = monitors.clone();
                             self.active = *active;
                             self.port = *port;
                             self.local_addrs = addrs.clone();
@@ -191,7 +204,27 @@ impl App {
                             self.transfers.push((name.clone(), *fraction, *bytes_per_sec));
                         }
                         UiEvent::Notice { text, .. } => self.toast = Some(text.clone()),
-                        UiEvent::Pairing { .. } | UiEvent::Discovered { .. } => {}
+                        UiEvent::Pairing { .. } | UiEvent::Discovered { .. } | UiEvent::Arrangement { .. } => {}
+                    }
+                }
+                // On the arranger screen, (re)load when the selection became
+                // invalid — e.g. the chosen peer just connected or dropped — but
+                // leave an in-progress edit alone while the peer stays connected.
+                if self.screen == Screen::Arranger {
+                    let connected = |p: &String| self.peers.iter().any(|s| &s.device == p && s.connected);
+                    let has_peer = self.peers.iter().any(|p| p.connected);
+                    let stale = match &self.selected_peer {
+                        Some(p) => !connected(p),
+                        None => true,
+                    };
+                    if has_peer {
+                        if stale {
+                            return self.load_arrangement();
+                        }
+                    } else {
+                        // Solo: keep the read-only own-monitor display current.
+                        self.selected_peer = None;
+                        self.arrangement = arranger::tiles_from_views(&self.own_monitors);
                     }
                 }
                 Task::none()
@@ -394,13 +427,53 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ArrRevert => {
-                self.arrangement = arranger::starter();
+            Message::ArrRevert => self.load_arrangement(),
+            Message::ArrApply => {
+                let Some(peer) = self.selected_peer.clone() else { return Task::none() };
+                let layout = arranger::to_virtual_desktop(&self.arrangement, &self.device_id, &peer);
+                Task::perform(
+                    ipc::request(UiRequest::SetLayout { peer, layout }),
+                    Message::Acted,
+                )
+            }
+            Message::ArrSelectPeer(peer) => {
+                self.selected_peer = Some(peer);
+                self.load_arrangement()
+            }
+            Message::ArrLoaded(Ok(events)) => {
+                if let Some(UiEvent::Arrangement { peer, layout, .. }) =
+                    events.into_iter().find(|e| matches!(e, UiEvent::Arrangement { .. }))
+                {
+                    self.selected_peer = Some(peer);
+                    self.arrangement = arranger::tiles_from_layout(&layout, &self.device_id);
+                }
                 Task::none()
             }
-            Message::ArrApply => {
-                let layout = arranger::to_virtual_desktop(&self.arrangement);
-                Task::perform(ipc::request(UiRequest::SetLayout { layout }), Message::Acted)
+            Message::ArrLoaded(Err(e)) => {
+                self.toast = Some(e);
+                Task::none()
+            }
+        }
+    }
+
+    /// Request the saved/seeded arrangement for the selected (or first connected)
+    /// peer. Clears the working model when no peer is connected.
+    fn load_arrangement(&mut self) -> Task<Message> {
+        let connected: Vec<String> =
+            self.peers.iter().filter(|p| p.connected).map(|p| p.device.clone()).collect();
+        let peer = match &self.selected_peer {
+            Some(p) if connected.contains(p) => Some(p.clone()),
+            _ => connected.first().cloned(),
+        };
+        self.selected_peer = peer.clone();
+        match peer {
+            Some(peer) => {
+                Task::perform(ipc::request(UiRequest::Arrangement { peer }), Message::ArrLoaded)
+            }
+            None => {
+                // No peer connected: show this device's own monitors, read-only.
+                self.arrangement = arranger::tiles_from_views(&self.own_monitors);
+                Task::none()
             }
         }
     }
@@ -566,7 +639,10 @@ impl App {
     }
 
     fn view_arranger(&self) -> Element<'_, Message> {
-        let canvas = Canvas::new(arranger::Arranger { tiles: &self.arrangement })
+        let connected: Vec<&PeerStatus> = self.peers.iter().filter(|p| p.connected).collect();
+        let editable = !connected.is_empty();
+
+        let canvas = Canvas::new(arranger::Arranger { tiles: &self.arrangement, editable })
             .width(Length::Fill)
             .height(Length::Fixed(320.0));
 
@@ -581,16 +657,50 @@ impl App {
             format!("{} displays - {} x {} virtual", self.arrangement.len(), r - l, b - t)
         };
 
-        column![
-            text("Arrange monitors").size(18),
+        let framed = container(canvas).width(Length::Fill).style(|_: &Theme| container::Style {
+            border: iced::Border {
+                width: 1.0,
+                color: iced::Color::from_rgb8(0xd0, 0xd5, 0xdc),
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        });
+
+        if !editable {
+            // Solo: nothing to arrange across machines; show our own monitors.
+            return column![
+                text("Arrange monitors").size(18),
+                text("Connect a paired device to arrange the two desktops together. \
+                      These are this computer's monitors:")
+                    .size(12),
+                framed,
+                text(extent).size(12),
+            ]
+            .spacing(10)
+            .into();
+        }
+
+        // One peer per connected device; a selector when there's more than one.
+        let mut col = column![text("Arrange monitors").size(18)].spacing(10);
+        if connected.len() > 1 {
+            let mut picker = row![text("Device:").size(13)].spacing(6);
+            for p in &connected {
+                let selected = self.selected_peer.as_deref() == Some(p.device.as_str());
+                let mut b = button(text(p.name.clone()).size(13));
+                b = if selected { b.style(button::primary) } else { b.style(button::secondary) };
+                picker = picker.push(b.on_press(Message::ArrSelectPeer(p.device.clone())));
+            }
+            col = col.push(picker);
+        } else if let Some(p) = connected.first() {
+            col = col.push(text(format!("Device: {}", p.name)).size(13));
+        }
+
+        col.push(
             text("Drag a display to match your physical desk; touching edges become cursor-crossing boundaries.").size(12),
-            container(canvas)
-                .width(Length::Fill)
-                .style(|_: &Theme| container::Style {
-                    border: iced::Border { width: 1.0, color: iced::Color::from_rgb8(0xd0, 0xd5, 0xdc), radius: 6.0.into() },
-                    ..container::Style::default()
-                }),
-            text(extent).size(12),
+        )
+        .push(framed)
+        .push(text(extent).size(12))
+        .push(
             row![
                 button("Auto-align tops").on_press(Message::ArrAlignTops),
                 button("Revert").on_press(Message::ArrRevert),
@@ -598,9 +708,7 @@ impl App {
                 button("Apply").on_press(Message::ArrApply).style(button::primary),
             ]
             .spacing(8),
-            text("Apply pushes SetLayout; the daemon-side handler for it is still a stub (see roadmap).").size(11),
-        ]
-        .spacing(10)
+        )
         .into()
     }
 

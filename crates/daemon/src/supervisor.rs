@@ -202,6 +202,14 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     // by the IPC handler for the "nearby waiting to pair" list.
     let discovered: Arc<Discovered> = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // Live connection registry (which peers have a session right now, and their
+    // monitors) and the saved per-peer arrangements, seeded from config.
+    let registry: crate::session::ConnRegistry =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let layouts: crate::session::LayoutStore = Arc::new(Mutex::new(
+        config.peer_layouts.iter().map(|p| (p.device, p.layout.clone())).collect(),
+    ));
+
     // Local control channel for the tray UI / `deskorynd status` (Unix domain
     // socket on Unix/macOS, named pipe on Windows).
     #[cfg(any(unix, windows))]
@@ -218,6 +226,9 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let paths_ipc = paths.clone();
         let local_fp_ipc = identity_fp;
         let discovered_ipc = discovered.clone();
+        let registry_ipc = registry.clone();
+        let layouts_ipc = layouts.clone();
+        let device_id = config.device.id;
 
         // Map a pairing snapshot to the wire event.
         fn pairing_event(s: crate::pairing::PairState) -> UiEvent {
@@ -234,25 +245,60 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             UiEvent::Pairing { phase: phase.into(), sas, peer }
         }
 
-        // Build a fresh Status snapshot from the (live) trust store.
+        // Map core monitors to the arranger's wire view (`dev` 0 = us, 1 = peer).
+        fn monitor_views(
+            monitors: &[deskoryn_core::layout::Monitor],
+            me: deskoryn_core::DeviceId,
+        ) -> Vec<crate::ipc::MonitorView> {
+            monitors
+                .iter()
+                .map(|m| crate::ipc::MonitorView {
+                    dev: if m.device() == me { 0 } else { 1 },
+                    index: m.id.index,
+                    label: m.label.clone(),
+                    x: m.bounds.x,
+                    y: m.bounds.y,
+                    w: m.bounds.w,
+                    h: m.bounds.h,
+                })
+                .collect()
+        }
+
+        // Build a fresh Status snapshot: trusted devices with live connection
+        // state from the registry, plus this device's own detected monitors.
         async fn status(
             trust: &tokio::sync::Mutex<deskoryn_core::trust::TrustStore>,
+            registry: &crate::session::ConnRegistry,
             device_name: String,
+            device_id: deskoryn_core::DeviceId,
             port: u16,
         ) -> Vec<UiEvent> {
+            let connected: std::collections::HashSet<deskoryn_core::DeviceId> =
+                registry.lock().await.keys().copied().collect();
             let t = trust.lock().await;
-            // TODO(impl): report live connection state from the session tasks.
             let peers = t
                 .devices
                 .iter()
                 .map(|d| PeerStatus {
                     name: d.name.clone(),
-                    connected: false,
+                    device: d.id.to_string(),
+                    connected: connected.contains(&d.id),
                     address: d.last_address.clone(),
                     latency_ms: None,
                 })
                 .collect();
-            vec![UiEvent::Status { device_name, peers, active: false, port, addrs: local_addrs(port) }]
+            let monitors = crate::monitors::detect_monitors(device_id)
+                .map(|m| monitor_views(&m, device_id))
+                .unwrap_or_default();
+            vec![UiEvent::Status {
+                device_name,
+                device_id: device_id.to_string(),
+                peers,
+                active: !connected.is_empty(),
+                port,
+                addrs: local_addrs(port),
+                monitors,
+            }]
         }
 
         let handler: ipc::Handler = std::sync::Arc::new(move |req| {
@@ -264,9 +310,57 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             let config = config_ipc.clone();
             let paths = paths_ipc.clone();
             let discovered = discovered_ipc.clone();
+            let registry = registry_ipc.clone();
+            let layouts = layouts_ipc.clone();
             Box::pin(async move {
                 match req {
-                    UiRequest::Status => status(&trust, device_name, listen_port).await,
+                    UiRequest::Status => {
+                        status(&trust, &registry, device_name, device_id, listen_port).await
+                    }
+                    UiRequest::Arrangement { peer } => {
+                        // Look up the connected peer for its real monitors; build
+                        // own + theirs + the saved-or-seeded combined layout.
+                        let Ok(target) = peer.parse::<deskoryn_core::DeviceId>() else {
+                            return vec![];
+                        };
+                        let reg = registry.lock().await;
+                        let Some(info) = reg.get(&target) else {
+                            return vec![]; // not connected → arranger stays disabled
+                        };
+                        let own = crate::monitors::detect_monitors(device_id).unwrap_or_default();
+                        let layout = {
+                            let store = layouts.lock().await;
+                            store.get(&target).cloned()
+                        }
+                        .unwrap_or_else(|| crate::session::seed_layout(&own, &info.monitors));
+                        vec![UiEvent::Arrangement {
+                            peer,
+                            own: monitor_views(&own, device_id),
+                            theirs: monitor_views(&info.monitors, device_id),
+                            layout,
+                        }]
+                    }
+                    UiRequest::SetLayout { peer, layout } => {
+                        let Ok(target) = peer.parse::<deskoryn_core::DeviceId>() else {
+                            return vec![];
+                        };
+                        // Persist: update the in-memory store, then rewrite the
+                        // config file's peer_layouts from it.
+                        {
+                            let mut store = layouts.lock().await;
+                            store.insert(target, layout.clone());
+                            let mut cfg = (*config).clone();
+                            cfg.set_layout_for(target, layout.clone());
+                            if let Err(e) = cfg.save(&paths.config_file()) {
+                                tracing::warn!(error = %e, "failed to persist peer layout");
+                            }
+                        }
+                        // Apply live if the peer is connected (best-effort).
+                        if let Some(info) = registry.lock().await.get(&target) {
+                            let _ = info.layout_tx.send(layout).await;
+                        }
+                        status(&trust, &registry, device_name, device_id, listen_port).await
+                    }
                     UiRequest::DiscoveredPeers => {
                         use crate::ipc::DiscoveredPeer;
                         let now = std::time::Instant::now();
@@ -386,7 +480,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                             }
                         }
                         // Return a fresh snapshot so the UI updates immediately.
-                        status(&trust, device_name, listen_port).await
+                        status(&trust, &registry, device_name, device_id, listen_port).await
                     }
                     _ => vec![],
                 }
@@ -402,7 +496,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     }
 
     if config.network.discovery_enabled {
-        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered).await {
+        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts).await {
             Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),
             Err(e) => tracing::warn!(error = %e, "mDNS discovery unavailable"),
         }
@@ -416,14 +510,18 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let pairing = pairing.clone();
         let trust_accept = trust.clone();
         let paths_accept = paths.clone();
+        let registry_accept = registry.clone();
+        let layouts_accept = layouts.clone();
         tokio::spawn(async move {
             use deskoryn_net::quic::Accepted;
             loop {
                 match endpoint.accept_any().await {
                     Ok(Accepted::Trusted(session)) => {
                         let config = config.clone();
+                        let registry = registry_accept.clone();
+                        let layouts = layouts_accept.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = crate::session::run(config, session).await {
+                            if let Err(e) = crate::session::run(config, session, registry, layouts).await {
                                 tracing::warn!(error = %e, "inbound session ended");
                             }
                         });
@@ -473,6 +571,8 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     for addr_str in addrs {
         let endpoint = endpoint.clone();
         let config = config.clone();
+        let registry = registry.clone();
+        let layouts = layouts.clone();
         tokio::spawn(async move {
             let mut backoff = Backoff::default();
             loop {
@@ -480,7 +580,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                     Ok(addr) => match endpoint.connect_any(addr).await {
                         Ok(session) => {
                             backoff = Backoff::default();
-                            if let Err(e) = crate::session::run(config.clone(), session).await {
+                            if let Err(e) = crate::session::run(config.clone(), session, registry.clone(), layouts.clone()).await {
                                 tracing::warn!(error = %e, peer = %addr_str, "session ended");
                             }
                         }
@@ -512,6 +612,8 @@ async fn start_discovery(
     fingerprint: deskoryn_core::trust::CertFingerprint,
     pairing: &Arc<crate::pairing::Pairing>,
     discovered: &Arc<Discovered>,
+    registry: &crate::session::ConnRegistry,
+    layouts: &crate::session::LayoutStore,
 ) -> anyhow::Result<()> {
     use deskoryn_net::discovery::{mdns::MdnsDiscovery, Discovery};
 
@@ -526,6 +628,8 @@ async fn start_discovery(
     let config = config.clone();
     let trust = trust.clone();
     let discovered = discovered.clone();
+    let registry = registry.clone();
+    let layouts = layouts.clone();
     // Peers we already have a session with (or are dialing), so repeated mDNS
     // re-resolutions don't spawn a storm of duplicate connections.
     let active: Arc<tokio::sync::Mutex<std::collections::HashSet<deskoryn_core::DeviceId>>> =
@@ -566,9 +670,11 @@ async fn start_discovery(
                 Ok(session) => {
                     let config = config.clone();
                     let active = active.clone();
+                    let registry = registry.clone();
+                    let layouts = layouts.clone();
                     let device = hint.device;
                     tokio::spawn(async move {
-                        if let Err(e) = crate::session::run(config, session).await {
+                        if let Err(e) = crate::session::run(config, session, registry, layouts).await {
                             tracing::warn!(error = %e, "discovered session ended");
                         }
                         active.lock().await.remove(&device);
@@ -642,7 +748,12 @@ async fn run_dry(config: Arc<AppConfig>) -> anyhow::Result<()> {
         }
     });
 
-    crate::session::run(config, Box::new(mine)).await?;
+    // Fresh, empty registry + saved-layout store for the dry run.
+    let registry: crate::session::ConnRegistry =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    let layouts: crate::session::LayoutStore =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    crate::session::run(config, Box::new(mine), registry, layouts).await?;
     let _ = peer_task.await;
     Ok(())
 }

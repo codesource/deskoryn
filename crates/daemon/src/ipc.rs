@@ -32,8 +32,13 @@ pub enum UiRequest {
     DiscoveredPeers,
     /// Forget a trusted device.
     Forget { device: String },
-    /// Push an edited virtual-desktop layout.
-    SetLayout { layout: deskoryn_core::VirtualDesktop },
+    /// Fetch the monitor arrangement for one connected peer (this device's
+    /// monitors + the peer's, plus the saved-or-seeded combined layout). `peer`
+    /// is the peer's device id in hex (as reported in [`PeerStatus::device`]).
+    Arrangement { peer: String },
+    /// Push an edited combined virtual-desktop layout for one peer; the daemon
+    /// persists it under that peer and applies it to the live session.
+    SetLayout { peer: String, layout: deskoryn_core::VirtualDesktop },
     /// Toggle a feature at runtime.
     SetFeature { feature: Feature, enabled: bool },
 }
@@ -52,6 +57,10 @@ pub enum Feature {
 pub enum UiEvent {
     Status {
         device_name: String,
+        /// This device's own id (hex), so the UI can tell its monitors from a
+        /// peer's in a combined layout.
+        #[serde(default)]
+        device_id: String,
         peers: Vec<PeerStatus>,
         active: bool,
         /// The daemon's actual bound QUIC listen port (0 if not yet bound).
@@ -61,6 +70,21 @@ pub enum UiEvent {
         /// by address while we're discoverable.
         #[serde(default)]
         addrs: Vec<String>,
+        /// This device's own detected monitors (with resolutions), shown
+        /// read-only when no peer is connected.
+        #[serde(default)]
+        monitors: Vec<MonitorView>,
+    },
+    /// The monitor arrangement for one peer (reply to [`UiRequest::Arrangement`]).
+    Arrangement {
+        /// The peer this arrangement is for (device id, hex).
+        peer: String,
+        /// This device's monitors (`dev = 0`).
+        own: Vec<MonitorView>,
+        /// The peer's monitors (`dev = 1`).
+        theirs: Vec<MonitorView>,
+        /// Saved-or-seeded combined layout to edit.
+        layout: deskoryn_core::VirtualDesktop,
     },
     /// Current pairing flow. `phase` ∈ idle | discoverable | connecting |
     /// prompt | paired | aborted | error; `sas`/`peer` set during prompt/result.
@@ -101,9 +125,25 @@ pub struct DiscoveredPeer {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
     pub name: String,
+    /// The peer's device id (hex), used to key its saved arrangement.
+    #[serde(default)]
+    pub device: String,
     pub connected: bool,
     pub address: Option<String>,
     pub latency_ms: Option<u32>,
+}
+
+/// One monitor as the arranger sees it: `dev` 0 = this machine, 1 = the peer.
+/// Mirrors `ui::arranger::MonTile`'s wire shape.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MonitorView {
+    pub dev: u8,
+    pub index: u16,
+    pub label: String,
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,10 +309,12 @@ mod tests {
                 match req {
                     UiRequest::Status => vec![UiEvent::Status {
                         device_name: "test-device".into(),
-                        peers: vec![PeerStatus { name: "peer".into(), connected: true, address: None, latency_ms: Some(7) }],
+                        device_id: String::new(),
+                        peers: vec![PeerStatus { name: "peer".into(), device: String::new(), connected: true, address: None, latency_ms: Some(7) }],
                         active: true,
                         port: 7345,
                         addrs: vec![],
+                        monitors: vec![],
                     }],
                     _ => vec![],
                 }

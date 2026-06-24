@@ -74,7 +74,26 @@ pub struct AppConfig {
     pub file_transfer: FileTransferConfig,
     /// The saved virtual-desktop layout. Empty until the user arranges monitors
     /// or it is negotiated on first connect.
+    ///
+    /// Deprecated by [`AppConfig::peer_layouts`]: a single global layout can't
+    /// distinguish between several paired peers. Kept for backward compatibility
+    /// with existing config files; the arranger reads/writes `peer_layouts`.
     #[serde(default)]
+    pub layout: VirtualDesktop,
+    /// Per-peer saved arrangements. Each entry is the *combined* virtual desktop
+    /// (this device's monitors + that peer's) the user laid out for one paired
+    /// device, keyed by the peer's [`DeviceId`]. A `Vec` (not a map) so it
+    /// round-trips cleanly as a TOML array-of-tables.
+    #[serde(default)]
+    pub peer_layouts: Vec<PeerLayout>,
+}
+
+/// A saved monitor arrangement for one specific paired peer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeerLayout {
+    /// The peer this arrangement belongs to.
+    pub device: DeviceId,
+    /// The combined virtual desktop (both machines' monitors) for that pairing.
     pub layout: VirtualDesktop,
 }
 
@@ -253,6 +272,21 @@ impl AppConfig {
             audio: AudioConfig::default(),
             file_transfer: FileTransferConfig::default(),
             layout: VirtualDesktop::default(),
+            peer_layouts: Vec::new(),
+        }
+    }
+
+    /// The saved arrangement for a specific peer, if the user has laid one out.
+    pub fn layout_for(&self, device: &DeviceId) -> Option<&VirtualDesktop> {
+        self.peer_layouts.iter().find(|p| &p.device == device).map(|p| &p.layout)
+    }
+
+    /// Store (upsert) the arrangement for a peer. Replaces any existing entry.
+    pub fn set_layout_for(&mut self, device: DeviceId, layout: VirtualDesktop) {
+        if let Some(entry) = self.peer_layouts.iter_mut().find(|p| p.device == device) {
+            entry.layout = layout;
+        } else {
+            self.peer_layouts.push(PeerLayout { device, layout });
         }
     }
 
@@ -278,5 +312,43 @@ impl AppConfig {
             cfg.save(path)?;
             Ok(cfg)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::{Rect, Size};
+    use crate::ids::MonitorId;
+    use crate::layout::Monitor;
+
+    #[test]
+    fn peer_layouts_round_trip_through_toml() {
+        let peer = DeviceId::generate();
+        let mut cfg = AppConfig::bootstrap("test-host");
+        let vd = VirtualDesktop::new(vec![Monitor {
+            id: MonitorId::new(peer, 0),
+            label: "Win-R".into(),
+            bounds: Rect::new(1920, 0, 2560, 1440),
+            native: Size { w: 2560, h: 1440 },
+            scale_pct: 100,
+        }]);
+        cfg.set_layout_for(peer, vd);
+
+        // set_layout_for upserts: a second call replaces, never duplicates.
+        cfg.set_layout_for(peer, cfg.layout_for(&peer).unwrap().clone());
+        assert_eq!(cfg.peer_layouts.len(), 1);
+
+        let dir = std::env::temp_dir().join(format!("deskoryn-cfg-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        cfg.save(&path).unwrap();
+        let loaded = AppConfig::load(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let got = loaded.layout_for(&peer).expect("peer layout survives a save/load");
+        assert_eq!(got.monitors.len(), 1);
+        assert_eq!(got.monitors[0].label, "Win-R");
+        assert_eq!(got.monitors[0].native, Size { w: 2560, h: 1440 });
+        assert!(loaded.layout_for(&DeviceId::generate()).is_none());
     }
 }
