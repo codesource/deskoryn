@@ -54,7 +54,9 @@ static_peers = []            # e.g. ["192.168.1.42:7423"] when mDNS is blocked
 # === Input sharing ========================================================
 [input]
 focus_follows_mouse = true
-edge_resistance_px  = 0       # hysteresis at desktop edges (0 = off)
+edge_resistance_px  = 0       # soft wall: px to push past a monitor edge before
+                              # the cursor hands off to the other PC (0 = off).
+                              # Also editable live from the GUI monitor arranger.
 switch_hotkey = "Ctrl+Alt+S"  # force cursor to the other machine
 lock_hotkey   = "Ctrl+Alt+L"  # lock cursor to current machine
 

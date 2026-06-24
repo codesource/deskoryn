@@ -15,6 +15,7 @@ use deskoryn_core::DeviceId;
 use deskoryn_net::transport::Session;
 use deskoryn_proto::{Channel, Control, PROTOCOL_VERSION};
 use std::collections::HashMap;
+use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
@@ -25,7 +26,16 @@ pub struct ConnInfo {
     pub monitors: Vec<Monitor>,
     /// Push a re-arranged combined layout to this session's input pump.
     pub layout_tx: mpsc::Sender<VirtualDesktop>,
+    /// Push a new edge-resistance value (px) to this session's input pump. Unlike
+    /// the layout, this is a local-only preference and is not synced to the peer.
+    pub edge_tx: mpsc::Sender<i32>,
 }
+
+/// The live edge-resistance soft wall (px), shared between the IPC handler (which
+/// updates it from the arranger and persists it) and each session (which seeds
+/// its controller from it on connect). Keeps a session that connects after a
+/// change — without a daemon restart — on the current value.
+pub type EdgeResistance = Arc<AtomicI32>;
 
 /// Currently-connected peers, keyed by device id. Empty ⇒ no peer connected
 /// (the arranger is disabled and shows only this device's monitors).
@@ -55,6 +65,7 @@ pub async fn run(
     session: Box<dyn Session>,
     registry: ConnRegistry,
     layouts: LayoutStore,
+    edge: EdgeResistance,
     config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     // Shared so the clipboard pump can open the FileXfer channel for file-paste
@@ -117,19 +128,27 @@ pub async fn run(
     // effective layout — local or peer-synced — into the input pump's controller.
     let (local_tx, local_rx) = mpsc::channel::<VirtualDesktop>(4);
     let (apply_tx, apply_rx) = mpsc::channel::<VirtualDesktop>(4);
+    // Edge-resistance changes (local-only) flow straight into the input pump.
+    let (edge_tx, edge_rx) = mpsc::channel::<i32>(4);
     {
         let mut reg = registry.lock().await;
-        reg.insert(peer, ConnInfo { monitors: peer_monitors.clone(), layout_tx: local_tx });
+        reg.insert(
+            peer,
+            ConnInfo { monitors: peer_monitors.clone(), layout_tx: local_tx, edge_tx },
+        );
     }
 
     // Build the input controller over the combined virtual desktop, starting the
     // cursor on one of our own monitors.
     let start = start_position(&layout, config.device.id);
-    let controller = crate::input::Controller::new(layout, config.device.id, start)
+    let mut controller = crate::input::Controller::new(layout, config.device.id, start)
         .with_input_config(&config.input)
         // Our detected monitors (local OS coords) let an incoming Enter warp the
         // cursor to exactly where the pointer crossed in.
         .with_local_monitors(own_monitors.clone());
+    // Seed the soft wall from the live shared value (which the arranger may have
+    // changed since startup), overriding the static config default.
+    controller.set_edge_resistance(edge.load(std::sync::atomic::Ordering::Relaxed));
     let capture = deskoryn_input::platform::open_capture()?;
     let injector = deskoryn_input::platform::open_injector()?;
     tracing::info!(backend = ?deskoryn_input::platform::detect(), "input backend");
@@ -154,7 +173,7 @@ pub async fn run(
         crate::control::HeartbeatConfig::default(),
         Some(layout_sync),
     );
-    let input = crate::input::run_input(session.as_ref(), controller, capture, injector, apply_rx);
+    let input = crate::input::run_input(session.as_ref(), controller, capture, injector, apply_rx, edge_rx);
 
     // Clipboard sync (text + images on the Clipboard channel; files stream over
     // dedicated streams). Skipped entirely when all clipboard sync is disabled;

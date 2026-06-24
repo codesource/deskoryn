@@ -22,6 +22,8 @@ pub enum UiRequest {
     Arrangement { peer: String },
     /// Push an edited combined layout for one peer.
     SetLayout { peer: String, layout: serde_json::Value },
+    /// Set the edge-resistance soft wall (px) before the cursor crosses machines.
+    SetEdgeResistance { px: i32 },
     SetFeature { feature: Feature, enabled: bool },
 }
 
@@ -48,6 +50,8 @@ pub enum UiEvent {
         addrs: Vec<String>,
         #[serde(default)]
         monitors: Vec<MonitorView>,
+        #[serde(default)]
+        edge_resistance_px: i32,
     },
     Arrangement {
         peer: String,

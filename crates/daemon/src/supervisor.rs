@@ -209,6 +209,10 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     let layouts: crate::session::LayoutStore = Arc::new(Mutex::new(
         config.peer_layouts.iter().map(|p| (p.device, p.layout.clone())).collect(),
     ));
+    // Live edge-resistance soft wall (px), seeded from config. The arranger
+    // updates it over IPC; each session seeds its controller from it on connect.
+    let edge: crate::session::EdgeResistance =
+        Arc::new(std::sync::atomic::AtomicI32::new(config.input.edge_resistance_px.max(0)));
 
     // Local control channel for the tray UI / `deskorynd status` (Unix domain
     // socket on Unix/macOS, named pipe on Windows).
@@ -228,6 +232,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let discovered_ipc = discovered.clone();
         let registry_ipc = registry.clone();
         let layouts_ipc = layouts.clone();
+        let edge_ipc = edge.clone();
         let device_id = config.device.id;
 
         // Map a pairing snapshot to the wire event.
@@ -272,6 +277,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             device_name: String,
             device_id: deskoryn_core::DeviceId,
             port: u16,
+            edge_resistance_px: i32,
         ) -> Vec<UiEvent> {
             let connected: std::collections::HashSet<deskoryn_core::DeviceId> =
                 registry.lock().await.keys().copied().collect();
@@ -298,6 +304,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                 port,
                 addrs: local_addrs(port),
                 monitors,
+                edge_resistance_px,
             }]
         }
 
@@ -312,10 +319,13 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             let discovered = discovered_ipc.clone();
             let registry = registry_ipc.clone();
             let layouts = layouts_ipc.clone();
+            let edge = edge_ipc.clone();
             Box::pin(async move {
+                use std::sync::atomic::Ordering;
                 match req {
                     UiRequest::Status => {
-                        status(&trust, &registry, device_name, device_id, listen_port).await
+                        let px = edge.load(Ordering::Relaxed);
+                        status(&trust, &registry, device_name, device_id, listen_port, px).await
                     }
                     UiRequest::Arrangement { peer } => {
                         // Look up the connected peer for its real monitors; build
@@ -359,7 +369,24 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         if let Some(info) = registry.lock().await.get(&target) {
                             let _ = info.layout_tx.send(layout).await;
                         }
-                        status(&trust, &registry, device_name, device_id, listen_port).await
+                        let px = edge.load(Ordering::Relaxed);
+                        status(&trust, &registry, device_name, device_id, listen_port, px).await
+                    }
+                    UiRequest::SetEdgeResistance { px } => {
+                        let px = px.max(0);
+                        // Update the live shared value, persist to config, then push
+                        // to every connected session's input pump (local-only; not
+                        // synced to peers).
+                        edge.store(px, Ordering::Relaxed);
+                        let mut cfg = (*config).clone();
+                        cfg.input.edge_resistance_px = px;
+                        if let Err(e) = cfg.save(&paths.config_file()) {
+                            tracing::warn!(error = %e, "failed to persist edge resistance");
+                        }
+                        for info in registry.lock().await.values() {
+                            let _ = info.edge_tx.send(px).await;
+                        }
+                        status(&trust, &registry, device_name, device_id, listen_port, px).await
                     }
                     UiRequest::DiscoveredPeers => {
                         use crate::ipc::DiscoveredPeer;
@@ -430,6 +457,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                     let endpoint2 = endpoint.clone();
                                     let registry2 = registry.clone();
                                     let layouts2 = layouts.clone();
+                                    let edge2 = edge.clone();
                                     tokio::spawn(async move {
                                         let mut last_err = String::from("no address");
                                         for cand in &candidates {
@@ -458,7 +486,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                                         spawn_peer_dial(
                                                             endpoint2.clone(), addr, config2.clone(),
                                                             registry2.clone(), layouts2.clone(),
-                                                            paths2.config_file(),
+                                                            edge2.clone(), paths2.config_file(),
                                                         );
                                                     }
                                                     return;
@@ -495,7 +523,8 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                             }
                         }
                         // Return a fresh snapshot so the UI updates immediately.
-                        status(&trust, &registry, device_name, device_id, listen_port).await
+                        let px = edge.load(Ordering::Relaxed);
+                        status(&trust, &registry, device_name, device_id, listen_port, px).await
                     }
                     _ => vec![],
                 }
@@ -511,7 +540,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     }
 
     if config.network.discovery_enabled {
-        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts, paths.config_file()).await {
+        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts, &edge, paths.config_file()).await {
             Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),
             Err(e) => tracing::warn!(error = %e, "mDNS discovery unavailable"),
         }
@@ -527,6 +556,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let paths_accept = paths.clone();
         let registry_accept = registry.clone();
         let layouts_accept = layouts.clone();
+        let edge_accept = edge.clone();
         tokio::spawn(async move {
             use deskoryn_net::quic::Accepted;
             loop {
@@ -535,9 +565,10 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         let config = config.clone();
                         let registry = registry_accept.clone();
                         let layouts = layouts_accept.clone();
+                        let edge = edge_accept.clone();
                         let config_path = paths_accept.config_file();
                         tokio::spawn(async move {
-                            if let Err(e) = crate::session::run(config, session, registry, layouts, config_path).await {
+                            if let Err(e) = crate::session::run(config, session, registry, layouts, edge, config_path).await {
                                 tracing::warn!(error = %e, "inbound session ended");
                             }
                         });
@@ -591,6 +622,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             config.clone(),
             registry.clone(),
             layouts.clone(),
+            edge.clone(),
             paths.config_file(),
         );
     }
@@ -611,6 +643,7 @@ fn spawn_peer_dial(
     config: Arc<AppConfig>,
     registry: crate::session::ConnRegistry,
     layouts: crate::session::LayoutStore,
+    edge: crate::session::EdgeResistance,
     config_path: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
@@ -625,6 +658,7 @@ fn spawn_peer_dial(
                             session,
                             registry.clone(),
                             layouts.clone(),
+                            edge.clone(),
                             config_path.clone(),
                         )
                         .await
@@ -657,6 +691,7 @@ async fn start_discovery(
     discovered: &Arc<Discovered>,
     registry: &crate::session::ConnRegistry,
     layouts: &crate::session::LayoutStore,
+    edge: &crate::session::EdgeResistance,
     config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     use deskoryn_net::discovery::{mdns::MdnsDiscovery, Discovery};
@@ -674,6 +709,7 @@ async fn start_discovery(
     let discovered = discovered.clone();
     let registry = registry.clone();
     let layouts = layouts.clone();
+    let edge = edge.clone();
     // Peers we already have a session with (or are dialing), so repeated mDNS
     // re-resolutions don't spawn a storm of duplicate connections.
     let active: Arc<tokio::sync::Mutex<std::collections::HashSet<deskoryn_core::DeviceId>>> =
@@ -716,10 +752,11 @@ async fn start_discovery(
                     let active = active.clone();
                     let registry = registry.clone();
                     let layouts = layouts.clone();
+                    let edge = edge.clone();
                     let config_path = config_path.clone();
                     let device = hint.device;
                     tokio::spawn(async move {
-                        if let Err(e) = crate::session::run(config, session, registry, layouts, config_path).await {
+                        if let Err(e) = crate::session::run(config, session, registry, layouts, edge, config_path).await {
                             tracing::warn!(error = %e, "discovered session ended");
                         }
                         active.lock().await.remove(&device);
@@ -798,7 +835,9 @@ async fn run_dry(config: Arc<AppConfig>, config_path: std::path::PathBuf) -> any
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let layouts: crate::session::LayoutStore =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    crate::session::run(config, Box::new(mine), registry, layouts, config_path).await?;
+    let edge: crate::session::EdgeResistance =
+        Arc::new(std::sync::atomic::AtomicI32::new(config.input.edge_resistance_px.max(0)));
+    crate::session::run(config, Box::new(mine), registry, layouts, edge, config_path).await?;
     let _ = peer_task.await;
     Ok(())
 }

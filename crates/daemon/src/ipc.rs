@@ -39,6 +39,10 @@ pub enum UiRequest {
     /// Push an edited combined virtual-desktop layout for one peer; the daemon
     /// persists it under that peer and applies it to the live session.
     SetLayout { peer: String, layout: deskoryn_core::VirtualDesktop },
+    /// Set the edge-resistance soft wall (px) the cursor must be pushed past
+    /// before it crosses to the other machine. Persisted to config and applied
+    /// live to every connected session.
+    SetEdgeResistance { px: i32 },
     /// Toggle a feature at runtime.
     SetFeature { feature: Feature, enabled: bool },
 }
@@ -74,6 +78,10 @@ pub enum UiEvent {
         /// read-only when no peer is connected.
         #[serde(default)]
         monitors: Vec<MonitorView>,
+        /// The edge-resistance soft wall (px) currently in effect, so the
+        /// arranger can show and edit it.
+        #[serde(default)]
+        edge_resistance_px: i32,
     },
     /// The monitor arrangement for one peer (reply to [`UiRequest::Arrangement`]).
     Arrangement {
@@ -315,6 +323,7 @@ mod tests {
                         port: 7345,
                         addrs: vec![],
                         monitors: vec![],
+                        edge_resistance_px: 0,
                     }],
                     _ => vec![],
                 }

@@ -252,6 +252,42 @@ fn is_neighbour(src: Rect, cand: Rect, via: Edge) -> bool {
     }
 }
 
+/// The landing point on `dst` when the cursor crosses *out of* `src` heading
+/// toward `to`, mapped so it lands **relative to where it left**:
+///
+/// * The coordinate *along* the shared edge is kept **proportional** — leaving
+///   90% of the way down a 1080-tall monitor enters 90% of the way down a
+///   1440-tall one, so a handoff between displays of different size/resolution
+///   feels continuous instead of jumping to an absolute pixel row.
+/// * The *crossing* coordinate snaps to `dst`'s near edge, so the cursor enters
+///   exactly at the boundary it crossed rather than some pixels deep inside the
+///   next monitor.
+///
+/// This is the entry math for a machine-boundary handoff (see the daemon's input
+/// controller). Same-machine monitor-to-monitor moves stay continuous and don't
+/// use this.
+pub fn relative_entry(src: Rect, dst: Rect, from: Point, to: Point) -> Point {
+    let via = exit_edge(src, from, to);
+    // Fraction along the source edge the cursor sat at when it crossed, taken
+    // from the post-move point clamped back into the source span.
+    let lerp = |v: i32, s_lo: i32, s_span: i32, d_lo: i32, d_span: i32| -> i32 {
+        let f = (v - s_lo).clamp(0, (s_span - 1).max(0));
+        d_lo + (f as i64 * d_span as i64 / s_span.max(1) as i64) as i32
+    };
+    match via {
+        Edge::Left | Edge::Right => {
+            let y = lerp(to.y, src.top(), src.h, dst.top(), dst.h);
+            let x = if matches!(via, Edge::Right) { dst.left() } else { dst.right() - 1 };
+            dst.clamp(Point::new(x, y))
+        }
+        Edge::Top | Edge::Bottom => {
+            let x = lerp(to.x, src.left(), src.w, dst.left(), dst.w);
+            let y = if matches!(via, Edge::Bottom) { dst.top() } else { dst.bottom() - 1 };
+            dst.clamp(Point::new(x, y))
+        }
+    }
+}
+
 /// Project `to` so the crossing coordinate sits just inside the neighbour while
 /// the orthogonal coordinate is preserved from the original target point.
 fn project(via: Edge, _src: Rect, to: Point) -> Point {
@@ -377,6 +413,37 @@ mod tests {
         assert_eq!(vd.place_beside(anchor, Edge::Bottom, size).unwrap(), Rect::new(0, 1080, 2560, 1440));
         assert_eq!(vd.place_beside(anchor, Edge::Top, size).unwrap(), Rect::new(0, -1440, 2560, 1440));
         assert!(vd.place_beside(MonitorId::new(dev(9), 0), Edge::Right, size).is_none());
+    }
+
+    #[test]
+    fn relative_entry_is_proportional_along_the_edge() {
+        // Leaving a 1920x1080 monitor on its right edge, entering a taller
+        // 2560x1440 monitor placed to the right.
+        let src = Rect::new(0, 0, 1920, 1080);
+        let dst = Rect::new(1920, 0, 2560, 1440);
+
+        // Crossing at the very top stays at the top.
+        let top = relative_entry(src, dst, Point::new(1900, 0), Point::new(1925, 0));
+        assert_eq!(top, Point::new(1920, 0));
+
+        // Crossing at the bottom (~100% down 1080) lands ~100% down 1440.
+        let bottom = relative_entry(src, dst, Point::new(1900, 1079), Point::new(1925, 1079));
+        assert_eq!(bottom.x, 1920, "enters at the near (left) edge of dst");
+        assert!(bottom.y >= 1438, "~bottom of the 1440-tall monitor, got {}", bottom.y);
+
+        // Crossing at the middle lands at the middle, not an absolute pixel row.
+        let mid = relative_entry(src, dst, Point::new(1900, 540), Point::new(1925, 540));
+        assert!((715..=725).contains(&mid.y), "~half of 1440, got {}", mid.y);
+    }
+
+    #[test]
+    fn relative_entry_snaps_to_the_near_edge() {
+        // A big overshoot deep into the next monitor still enters at its edge.
+        let src = Rect::new(0, 0, 1920, 1080);
+        let dst = Rect::new(1920, 0, 1920, 1080);
+        let e = relative_entry(src, dst, Point::new(1900, 500), Point::new(2400, 500));
+        assert_eq!(e.x, 1920, "snaps to dst's left edge, not 480px deep");
+        assert_eq!(e.y, 500);
     }
 
     #[test]

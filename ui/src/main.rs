@@ -82,6 +82,8 @@ struct App {
     selected_peer: Option<String>, // device id (hex) of the peer being arranged
     arr_fit: (i32, i32, i32, i32), // frozen bounding box the canvas fits + centers
     arr_dirty: bool,               // unsaved local edits (suppresses auto-refresh)
+    edge_resistance_px: i32,       // current soft-wall width reported by the daemon
+    edge_input: String,            // the arranger's editable edge-resistance field
 }
 
 #[derive(Clone, Debug)]
@@ -118,6 +120,8 @@ enum Message {
     ArrApply,
     ArrSelectPeer(String),
     ArrLoaded(Result<Vec<UiEvent>, String>),
+    EdgeResistanceChanged(String),
+    EdgeResistanceSet,
 }
 
 impl App {
@@ -150,6 +154,8 @@ impl App {
             selected_peer: None,
             arr_fit: (0, 0, 0, 0),
             arr_dirty: false,
+            edge_resistance_px: 0,
+            edge_input: String::new(),
         };
         let proc = app.proc.clone();
         // Load the persisted binary override, then do a first refresh.
@@ -195,7 +201,7 @@ impl App {
                 self.transfers.clear();
                 for ev in &events {
                     match ev {
-                        UiEvent::Status { device_name, device_id, peers, active, port, addrs, monitors } => {
+                        UiEvent::Status { device_name, device_id, peers, active, port, addrs, monitors, edge_resistance_px } => {
                             self.device_name = device_name.clone();
                             self.device_id = device_id.clone();
                             self.peers = peers.clone();
@@ -203,6 +209,13 @@ impl App {
                             self.active = *active;
                             self.port = *port;
                             self.local_addrs = addrs.clone();
+                            self.edge_resistance_px = *edge_resistance_px;
+                            // Seed the editable field on first load; afterwards leave
+                            // whatever the user has typed so a 2s poll never clobbers
+                            // an in-progress edit.
+                            if self.edge_input.is_empty() {
+                                self.edge_input = edge_resistance_px.to_string();
+                            }
                         }
                         UiEvent::TransferProgress { name, fraction, bytes_per_sec, .. } => {
                             self.transfers.push((name.clone(), *fraction, *bytes_per_sec));
@@ -471,6 +484,19 @@ impl App {
                 self.toast = Some(e);
                 Task::none()
             }
+            Message::EdgeResistanceChanged(s) => {
+                // Keep only digits so the field always parses as a pixel count.
+                self.edge_input = s.chars().filter(|c| c.is_ascii_digit()).collect();
+                Task::none()
+            }
+            Message::EdgeResistanceSet => {
+                let px = self.edge_input.parse::<i32>().unwrap_or(0).max(0);
+                self.edge_input = px.to_string();
+                Task::perform(
+                    ipc::request(UiRequest::SetEdgeResistance { px }),
+                    Message::Acted,
+                )
+            }
         }
     }
 
@@ -658,6 +684,44 @@ impl App {
         .into()
     }
 
+    /// The edge-resistance ("soft wall") editor shown on the arranger screen. A
+    /// global, machine-crossing preference: how far the cursor must be pushed past
+    /// a monitor edge before it hands off to the other PC. Persisted to config.
+    fn edge_control(&self) -> Element<'_, Message> {
+        // Flag an unsaved edit: the field differs from what the daemon reports.
+        let pending = self.edge_input.parse::<i32>().ok() != Some(self.edge_resistance_px);
+        // The value lives in the daemon, so the control is only live while it is
+        // running; otherwise the field is disabled (no handlers = grayed out).
+        let mut field = text_input("0", &self.edge_input).width(Length::Fixed(80.0));
+        let mut set = button("Set");
+        if self.reachable {
+            field = field
+                .on_input(Message::EdgeResistanceChanged)
+                .on_submit(Message::EdgeResistanceSet);
+            set = set.on_press(Message::EdgeResistanceSet);
+        }
+        let status = if !self.reachable {
+            "start the daemon to change".to_string()
+        } else if pending {
+            format!("active: {} px", self.edge_resistance_px)
+        } else {
+            "saved".to_string()
+        };
+        column![
+            text("Edge resistance").size(14),
+            row![field, text("px").size(13), set, text(status).size(11)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            text(
+                "Push the cursor this many pixels past a monitor's edge before it crosses to the \
+                 other PC. 0 = cross immediately."
+            )
+            .size(11),
+        ]
+        .spacing(6)
+        .into()
+    }
+
     fn view_arranger(&self) -> Element<'_, Message> {
         let connected: Vec<&PeerStatus> = self.peers.iter().filter(|p| p.connected).collect();
         let editable = !connected.is_empty();
@@ -695,6 +759,8 @@ impl App {
                     .size(12),
                 framed,
                 text(extent).size(12),
+                horizontal_rule(1),
+                self.edge_control(),
             ]
             .spacing(10)
             .into();
@@ -729,6 +795,8 @@ impl App {
             ]
             .spacing(8),
         )
+        .push(horizontal_rule(1))
+        .push(self.edge_control())
         .into()
     }
 
@@ -738,11 +806,16 @@ impl App {
             col = col.push(text("No trusted devices yet.").size(13));
         }
         for p in &self.peers {
+            // Forgetting a device is a daemon action; disable it when offline.
+            let mut forget = button("Forget").style(button::danger);
+            if self.reachable {
+                forget = forget.on_press(Message::Forget(p.name.clone()));
+            }
             col = col.push(row![
                 text(if p.connected { "*" } else { "o" }),
                 text(p.name.clone()).width(Length::Fill),
                 text(p.address.clone().unwrap_or_default()).size(12),
-                button("Forget").style(button::danger).on_press(Message::Forget(p.name.clone())),
+                forget,
             ].spacing(10).align_y(Alignment::Center));
         }
         col = col.push(horizontal_rule(1));
@@ -882,19 +955,27 @@ impl App {
     }
 
     fn view_settings(&self) -> Element<'_, Message> {
+        // Features are applied by the daemon over IPC, so the toggles are only
+        // active while it is running (no on_toggle handler = disabled control).
+        let reachable = self.reachable;
         let toggle = |label: &str, on: bool, f: Feature| {
-            checkbox(label.to_string(), on).on_toggle(move |b| Message::SetFeature(f, b))
+            let c = checkbox(label.to_string(), on);
+            if reachable {
+                c.on_toggle(move |b| Message::SetFeature(f, b))
+            } else {
+                c
+            }
         };
-        column![
-            text("Features").size(18),
-            toggle("Input sharing", self.features.input, Feature::InputSharing),
-            toggle("Clipboard sync", self.features.clipboard, Feature::ClipboardSync),
-            toggle("Audio forwarding", self.features.audio, Feature::AudioForward),
-            horizontal_rule(1),
-            text("Input, Clipboard, Files, Network, Startup groups mirror config.toml;").size(12),
-            text("editing them lives in config.toml until the daemon exposes config over IPC.").size(12),
-        ]
-        .spacing(10)
-        .into()
+        let mut col = column![text("Features").size(18)].spacing(10);
+        if !reachable {
+            col = col.push(text("Start the daemon (Connection tab) to change features.").size(12));
+        }
+        col.push(toggle("Input sharing", self.features.input, Feature::InputSharing))
+            .push(toggle("Clipboard sync", self.features.clipboard, Feature::ClipboardSync))
+            .push(toggle("Audio forwarding", self.features.audio, Feature::AudioForward))
+            .push(horizontal_rule(1))
+            .push(text("Input, Clipboard, Files, Network, Startup groups mirror config.toml;").size(12))
+            .push(text("editing them lives in config.toml until the daemon exposes config over IPC.").size(12))
+            .into()
     }
 }

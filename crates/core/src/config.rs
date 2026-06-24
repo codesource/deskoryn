@@ -128,8 +128,11 @@ impl Default for NetworkConfig {
 pub struct InputConfig {
     /// Keyboard focus follows the mouse across the machine boundary.
     pub focus_follows_mouse: bool,
-    /// Pixels of "stickiness" at the desktop's outer edges before the cursor
-    /// will leave a monitor (prevents accidental handoff). 0 disables.
+    /// Soft wall before the cursor crosses to the *other machine*: the pixels of
+    /// outward push you must force past a monitor's shared edge before control
+    /// hands off. The cursor sticks at the edge until this much overshoot
+    /// accumulates, then enters the peer relative to where it crossed. Prevents
+    /// accidental handoff when you slam the pointer to the edge. 0 disables.
     pub edge_resistance_px: i32,
     /// Hotkey (in the textual form parsed by `deskoryn-input`) that forces the
     /// cursor to the other machine regardless of position.

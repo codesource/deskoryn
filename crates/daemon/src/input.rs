@@ -17,6 +17,7 @@ use bytes::BytesMut;
 use deskoryn_core::config::InputConfig;
 use deskoryn_core::geometry::{Point, Rect};
 use deskoryn_core::input::{InputEvent, KeyCode, Modifiers};
+use deskoryn_core::layout::relative_entry;
 use deskoryn_core::{DeviceId, Monitor, VirtualDesktop};
 use deskoryn_input::hotkey::Hotkey;
 use deskoryn_input::{Capture, Injector};
@@ -99,6 +100,13 @@ impl Controller {
     pub fn with_local_monitors(mut self, local: Vec<Monitor>) -> Self {
         self.local = local;
         self
+    }
+
+    /// Update the edge-resistance soft wall at runtime (from the arranger over
+    /// IPC). Resets any in-progress push so the new threshold applies cleanly.
+    pub fn set_edge_resistance(&mut self, px: i32) {
+        self.edge_px = px.max(0);
+        self.edge_accum = 0;
     }
 
     /// Map a virtual-desktop entry point to a normalized absolute position
@@ -299,9 +307,17 @@ impl Controller {
                     }
                     self.edge_accum = 0;
                 }
-                self.pos = new;
+                // Enter the peer monitor *relative to where we left*: proportional
+                // along the shared edge, snapped to the boundary (see
+                // `relative_entry`). Falls back to the raw point if either monitor
+                // can't be resolved (shouldn't happen for an edge-to-edge layout).
+                let entry = match (self.vd.monitor_at(self.pos), self.vd.monitor_at(new)) {
+                    (Some(src), Some(dst)) => relative_entry(src.bounds, dst.bounds, self.pos, new),
+                    _ => new,
+                };
+                self.pos = entry;
                 self.grabbed = true;
-                vec![Action::Enter { at: new, mods: self.mods }]
+                vec![Action::Enter { at: entry, mods: self.mods }]
             }
             // Crossing back to us.
             (true, false) => {
@@ -365,12 +381,14 @@ pub async fn run_input(
     mut capture: Box<dyn Capture>,
     mut injector: Box<dyn Injector>,
     mut layout_rx: tokio::sync::mpsc::Receiver<VirtualDesktop>,
+    mut edge_rx: tokio::sync::mpsc::Receiver<i32>,
 ) -> anyhow::Result<()> {
     let (mut sink, mut source) = session.channel(Channel::Input).await?;
     let mut seq: u32 = 0;
-    // Once all senders drop (the arranger handler is gone), park this arm so the
+    // Once all senders drop (the arranger handler is gone), park these arms so a
     // closed channel doesn't spin the select loop on an immediate `None`.
     let mut layout_open = true;
+    let mut edge_open = true;
 
     loop {
         tokio::select! {
@@ -382,6 +400,16 @@ pub async fn run_input(
                         controller.set_layout(vd);
                     }
                     None => layout_open = false,
+                }
+            }
+            // Live edge-resistance change: the arranger pushed a new soft-wall width.
+            maybe = async { edge_rx.recv().await }, if edge_open => {
+                match maybe {
+                    Some(px) => {
+                        tracing::info!(edge_px = px, "applying edge resistance");
+                        controller.set_edge_resistance(px);
+                    }
+                    None => edge_open = false,
                 }
             }
             ev = capture.next_event() => {
@@ -522,6 +550,33 @@ mod tests {
         // Enough accumulated push now crosses.
         let acts = c.on_event(InputEvent::PointerMotion { dx: 50, dy: 0 });
         assert!(matches!(acts.as_slice(), [Action::Enter { .. }]));
+        assert!(c.grabbed());
+    }
+
+    #[test]
+    fn handoff_enters_peer_relative_to_crossing_point() {
+        let a = dev(1);
+        let b = dev(2);
+        let m = |d, i, x, y, w, h| Monitor {
+            id: MonitorId::new(d, i),
+            label: String::new(),
+            bounds: Rect::new(x, y, w, h),
+            native: Size::new(w, h),
+            scale_pct: 100,
+        };
+        // A: 1920x1080 at origin. B: a taller 2560x1440 to its right.
+        let vd = VirtualDesktop::new(vec![m(a, 0, 0, 0, 1920, 1080), m(b, 0, 1920, 0, 2560, 1440)]);
+        // Sit near the bottom of A's right edge and step across.
+        let mut c = Controller::new(vd, a, Point::new(1919, 1000));
+        let acts = c.on_event(InputEvent::PointerMotion { dx: 5, dy: 0 });
+        match acts.as_slice() {
+            [Action::Enter { at, .. }] => {
+                assert_eq!(at.x, 1920, "enters exactly at B's left edge");
+                // ~1000/1080 down A maps proportionally into the 1440-tall B.
+                assert!((1320..=1340).contains(&at.y), "proportional entry y, got {}", at.y);
+            }
+            other => panic!("expected Enter, got {other:?}"),
+        }
         assert!(c.grabbed());
     }
 
@@ -730,14 +785,16 @@ mod tests {
         let ctrl_b = Controller::new(vd, b, Point::new(2000, 500)).with_local_monitors(b_local);
         let inj_b = Box::new(RecordingInjector { log: log.clone() });
 
-        // No live re-arrange in this test; hold the senders so the arms park.
+        // No live re-arrange / edge change in this test; hold the senders so the arms park.
         let (_tx_a, rx_a) = tokio::sync::mpsc::channel(1);
         let (_tx_b, rx_b) = tokio::sync::mpsc::channel(1);
+        let (_etx_a, erx_a) = tokio::sync::mpsc::channel(1);
+        let (_etx_b, erx_b) = tokio::sync::mpsc::channel(1);
         let pa = tokio::spawn(async move {
-            run_input(sa.as_ref(), ctrl_a, cap_a, Box::new(NullInjector), rx_a).await
+            run_input(sa.as_ref(), ctrl_a, cap_a, Box::new(NullInjector), rx_a, erx_a).await
         });
         let pb = tokio::spawn(async move {
-            run_input(sb.as_ref(), ctrl_b, Box::new(IdleCapture), inj_b, rx_b).await
+            run_input(sb.as_ref(), ctrl_b, Box::new(IdleCapture), inj_b, rx_b, erx_b).await
         });
 
         // Wait until B has recorded the warp, both key events, and the release.
