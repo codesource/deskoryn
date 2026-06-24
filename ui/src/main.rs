@@ -1,7 +1,7 @@
 // No console window on Windows release builds.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-//! Deskoryn tray UI — a self-contained iced client for the `deskorynd` daemon.
+//! Deskoryn tray UI - a self-contained iced client for the `deskorynd` daemon.
 //!
 //! Pure Rust, no system webview. The app holds no networking of its own beyond
 //! the local control channel ([`ipc`]); it can also launch/stop the daemon
@@ -320,7 +320,7 @@ impl App {
                 {
                     // Don't let a racy/stale "idle" snapshot (the dial reply can
                     // arrive before the handshake updates state) cancel an active
-                    // flow — returning to idle is driven locally by PairClear.
+                    // flow - returning to idle is driven locally by PairClear.
                     if phase != "idle" {
                         self.pair_phase = phase;
                         self.pair_sas = sas;
@@ -414,11 +414,11 @@ impl App {
             }
         };
         let dot = if !self.reachable {
-            "○ daemon offline"
+            "daemon offline"
         } else if self.peers.iter().any(|p| p.connected) {
-            if self.active { "● connected" } else { "◐ connected" }
+            if self.active { "connected" } else { "connected (paused)" }
         } else {
-            "○ searching…"
+            "searching..."
         };
         column![
             text("Deskoryn").size(20),
@@ -444,7 +444,7 @@ impl App {
     fn view_status(&self) -> Element<'_, Message> {
         let mut col = column![text(format!(
             "This workspace{}",
-            if self.device_name.is_empty() { String::new() } else { format!(" — {}", self.device_name) }
+            if self.device_name.is_empty() { String::new() } else { format!(" - {}", self.device_name) }
         ))
         .size(18)]
         .spacing(10);
@@ -466,13 +466,13 @@ impl App {
                 "offline".into()
             };
             col = col.push(row![
-                text(if p.connected { "●" } else { "○" }),
+                text(if p.connected { "*" } else { "o" }),
                 text(p.name.clone()).width(Length::Fill),
                 text(meta),
             ].spacing(10));
         }
         col = col.push(horizontal_rule(1));
-        col = col.push(text("Ctrl+Alt+L lock cursor here · Ctrl+Alt+S switch machine").size(12));
+        col = col.push(text("Ctrl+Alt+L lock cursor here - Ctrl+Alt+S switch machine").size(12));
         col.into()
     }
 
@@ -480,15 +480,15 @@ impl App {
         let running = self.life.running;
 
         // Daemon lifecycle. The daemon is symmetric: it listens AND auto-connects
-        // to paired peers found on the LAN via mDNS — no client/server split.
+        // to paired peers found on the LAN via mDNS - no client/server split.
         let state = if running {
             if self.port != 0 {
-                format!("● running · listening on port {}", self.port)
+                format!("running - listening on port {}", self.port)
             } else {
-                "● running".to_string()
+                "running".to_string()
             }
         } else {
-            "○ stopped".to_string()
+            "stopped".to_string()
         };
         let start = if running || !self.bin.exists {
             button("Start daemon")
@@ -558,9 +558,9 @@ impl App {
             |(l, t, r, b), m| (l.min(m.x), t.min(m.y), r.max(m.x + m.w), b.max(m.y + m.h)),
         );
         let extent = if self.arrangement.is_empty() {
-            "—".to_string()
+            "-".to_string()
         } else {
-            format!("{} displays · {} × {} virtual", self.arrangement.len(), r - l, b - t)
+            format!("{} displays - {} x {} virtual", self.arrangement.len(), r - l, b - t)
         };
 
         column![
@@ -593,7 +593,7 @@ impl App {
         }
         for p in &self.peers {
             col = col.push(row![
-                text(if p.connected { "●" } else { "○" }),
+                text(if p.connected { "*" } else { "o" }),
                 text(p.name.clone()).width(Length::Fill),
                 text(p.address.clone().unwrap_or_default()).size(12),
                 button("Forget").style(button::danger).on_press(Message::Forget(p.name.clone())),
@@ -610,12 +610,12 @@ impl App {
                 text(if self.pair_peer.is_empty() {
                     "Pair with this device?".to_string()
                 } else {
-                    format!("Pair with “{}”?", self.pair_peer)
+                    format!("Pair with '{}'?", self.pair_peer)
                 })
                 .size(16),
                 text("Confirm this code matches on BOTH machines:").size(13),
                 text(self.pair_sas.clone()).size(40),
-                text("If they differ, someone may be intercepting — don't continue.").size(12),
+                text("If they differ, someone may be intercepting - don't continue.").size(12),
                 row![
                     button("They don't match").on_press(Message::PairRespond(false)).style(button::danger),
                     button("Confirm").on_press(Message::PairRespond(true)).style(button::primary),
@@ -625,18 +625,18 @@ impl App {
             .spacing(10),
             "discoverable" => column![
                 text("Pairing").size(16),
-                text("Waiting for a peer to connect…").size(14),
+                text("Waiting for a peer to connect...").size(14),
                 button("Cancel").on_press(Message::PairClear),
             ]
             .spacing(8),
             "connecting" => column![
                 text("Pairing").size(16),
-                text("Connecting…").size(14),
+                text("Connecting...").size(14),
                 button("Cancel").on_press(Message::PairClear),
             ]
             .spacing(8),
             "paired" => column![
-                text(format!("Paired with {} ✓", self.pair_peer)).size(16),
+                text(format!("Paired with {}", self.pair_peer)).size(16),
                 button("Close").on_press(Message::PairClear),
             ]
             .spacing(8),
@@ -663,11 +663,11 @@ impl App {
                 // Nearby devices currently accepting pairing (auto-discovered).
                 let nearby: Vec<_> = self.nearby.iter().filter(|p| !p.trusted).collect();
                 if !nearby.is_empty() {
-                    c = c.push(text("Nearby — waiting to pair:").size(13));
+                    c = c.push(text("Nearby - waiting to pair:").size(13));
                     for p in nearby {
                         c = c.push(
                             row![
-                                text(format!("● {}", p.name)).width(Length::Fill),
+                                text(format!("* {}", p.name)).width(Length::Fill),
                                 text(p.device.clone()).size(11),
                                 button("Pair").on_press(Message::PairDial(p.addr.clone())).style(button::primary),
                             ]
@@ -678,7 +678,7 @@ impl App {
                     c = c.push(horizontal_rule(1));
                 }
 
-                c = c.push(text("Or pair manually — confirm the same 6-digit code on both machines.").size(12));
+                c = c.push(text("Or pair manually - confirm the same 6-digit code on both machines.").size(12));
                 c = c.push(row![wait, connect].spacing(8));
                 if !self.pair_listen {
                     c = c.push(
@@ -712,7 +712,7 @@ impl App {
             let pct = (fraction * 100.0).round() as u32;
             col = col.push(row![
                 text(name.clone()).width(Length::Fill),
-                text(format!("{pct}% · {} KB/s", bps / 1024)),
+                text(format!("{pct}% - {} KB/s", bps / 1024)),
             ].spacing(10));
         }
         col.into()

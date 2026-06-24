@@ -27,7 +27,7 @@ pub struct MonTile {
 }
 
 /// Seed model: three 1080p displays on this machine, two 1440p on the peer to
-/// their right — the bring-up rig.
+/// their right - the bring-up rig.
 pub fn starter() -> Vec<MonTile> {
     let mut v = Vec::new();
     for i in 0..3 {
@@ -95,7 +95,7 @@ pub fn snap(idx: usize, mut x: i32, mut y: i32, tiles: &[MonTile]) -> (i32, i32)
 }
 
 /// Serialize the working model into the `deskoryn_core::VirtualDesktop` JSON
-/// shape the daemon deserializes (placeholder device ids — see the gap above).
+/// shape the daemon deserializes (placeholder device ids - see the gap above).
 pub fn to_virtual_desktop(tiles: &[MonTile]) -> serde_json::Value {
     let monitors: Vec<_> = tiles
         .iter()
@@ -209,7 +209,7 @@ impl canvas::Program<Message> for Arranger<'_> {
             frame.fill(&rect, if m.dev == 0 { local } else { peer });
             frame.stroke(&rect, Stroke::default().with_color(border).with_width(1.5));
             frame.fill_text(Text {
-                content: format!("{}\n{}×{}", m.label, m.w, m.h),
+                content: format!("{}\n{}x{}", m.label, m.w, m.h),
                 position: Point::new(top_left.x + size.width / 2.0, top_left.y + size.height / 2.0),
                 color: Color::WHITE,
                 size: 12.0.into(),
