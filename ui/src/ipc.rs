@@ -39,6 +39,8 @@ pub enum UiEvent {
         active: bool,
         #[serde(default)]
         port: u16,
+        #[serde(default)]
+        addrs: Vec<String>,
     },
     Pairing {
         phase: String,

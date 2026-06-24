@@ -194,7 +194,7 @@ async fn status_command(paths: &Paths) -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("no running daemon at {} ({e})", socket.display()))?;
         for ev in events {
-            if let UiEvent::Status { device_name, peers, active, port } = ev {
+            if let UiEvent::Status { device_name, peers, active, port, .. } = ev {
                 println!("device: {device_name}");
                 println!("active: {active}");
                 println!("port:   {port}");

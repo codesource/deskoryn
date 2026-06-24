@@ -107,6 +107,57 @@ fn inbound_firewall_hint() -> Option<String> {
     None
 }
 
+/// This device's own dialable `ip:port` addresses, for the "connect by address"
+/// hint shown while discoverable. Filters out un-routable addresses (loopback,
+/// IPv4 link-local/APIPA `169.254/16`, IPv6 `fe80::/10` link-local) so we never
+/// surface something a peer can't reach.
+#[cfg(any(feature = "linux", feature = "windows"))]
+fn local_addrs(port: u16) -> Vec<String> {
+    use std::net::IpAddr;
+    let dialable = |ip: &IpAddr| match ip {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && (v6.segments()[0] & 0xffc0) != 0xfe80
+        }
+    };
+    // Skip virtual/container/VPN interfaces — their addresses (Docker 172.x,
+    // libvirt 192.168.122.x, WireGuard/Tailscale, etc.) aren't reachable from a
+    // LAN peer. IP range alone can't tell these from a real LAN, so go by name.
+    let is_virtual = |name: &str| {
+        let n = name.to_ascii_lowercase();
+        n == "lo"
+            || [
+                "docker", "br-", "virbr", "veth", "vnet", "vmnet", "vbox", "tun", "tap",
+                "wg", "tailscale", "zt", "utun", "awdl", "llw",
+            ]
+            .iter()
+            .any(|p| n.starts_with(p))
+            || ["vethernet", "vmware", "virtualbox", "hyper-v", "loopback"]
+                .iter()
+                .any(|p| n.contains(p))
+    };
+    let mut v4: Vec<std::net::SocketAddr> = Vec::new();
+    let mut v6: Vec<std::net::SocketAddr> = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in ifaces {
+            if is_virtual(&iface.name) {
+                continue;
+            }
+            let ip = iface.ip();
+            if dialable(&ip) {
+                let a = std::net::SocketAddr::new(ip, port);
+                if ip.is_ipv4() { v4.push(a) } else { v6.push(a) }
+            }
+        }
+    }
+    // Sort numerically (SocketAddr/IpAddr order by value, not lexicographically).
+    v4.sort();
+    v4.dedup();
+    v6.sort();
+    v6.dedup();
+    v4.into_iter().chain(v6).map(|a| a.to_string()).collect() // IPv4 first
+}
+
 /// A peer last seen over mDNS.
 #[cfg(any(feature = "linux", feature = "windows"))]
 struct DiscEntry {
@@ -201,7 +252,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                     latency_ms: None,
                 })
                 .collect();
-            vec![UiEvent::Status { device_name, peers, active: false, port }]
+            vec![UiEvent::Status { device_name, peers, active: false, port, addrs: local_addrs(port) }]
         }
 
         let handler: ipc::Handler = std::sync::Arc::new(move |req| {

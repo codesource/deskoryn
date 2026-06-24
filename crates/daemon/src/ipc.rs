@@ -57,6 +57,10 @@ pub enum UiEvent {
         /// The daemon's actual bound QUIC listen port (0 if not yet bound).
         #[serde(default)]
         port: u16,
+        /// This device's own dialable `ip:port` addresses, so a peer can connect
+        /// by address while we're discoverable.
+        #[serde(default)]
+        addrs: Vec<String>,
     },
     /// Current pairing flow. `phase` ∈ idle | discoverable | connecting |
     /// prompt | paired | aborted | error; `sas`/`peer` set during prompt/result.
@@ -268,6 +272,7 @@ mod tests {
                         peers: vec![PeerStatus { name: "peer".into(), connected: true, address: None, latency_ms: Some(7) }],
                         active: true,
                         port: 7345,
+                        addrs: vec![],
                     }],
                     _ => vec![],
                 }
@@ -285,7 +290,7 @@ mod tests {
         let resp = request(&sock, &UiRequest::Status).await.unwrap();
         assert_eq!(resp.len(), 1);
         match &resp[0] {
-            UiEvent::Status { device_name, peers, active, port } => {
+            UiEvent::Status { device_name, peers, active, port, .. } => {
                 assert_eq!(device_name, "test-device");
                 assert!(*active);
                 assert_eq!(*port, 7345);

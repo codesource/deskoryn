@@ -563,6 +563,7 @@ dependencies = [
  "deskoryn-input",
  "deskoryn-net",
  "deskoryn-proto",
+ "if-addrs",
  "serde",
  "serde_json",
  "tokio",

@@ -13,8 +13,8 @@ path = "src/main.rs"
 [features]
 default = []
 # Convenience meta-features to turn on real backends for a real build.
-linux = ["deskoryn-net/full", "deskoryn-input/linux-backend", "deskoryn-clipboard/linux-backend", "deskoryn-audio/linux-backend"]
-windows = ["deskoryn-net/full", "deskoryn-input/windows-backend", "deskoryn-clipboard/windows-backend", "deskoryn-audio/windows-backend"]
+linux = ["deskoryn-net/full", "deskoryn-input/linux-backend", "deskoryn-clipboard/linux-backend", "deskoryn-audio/linux-backend", "dep:if-addrs"]
+windows = ["deskoryn-net/full", "deskoryn-input/windows-backend", "deskoryn-clipboard/windows-backend", "deskoryn-audio/windows-backend", "dep:if-addrs"]
 # Opt-in real Opus codec (needs libopus / pkg-config at build time).
 audio-opus = ["deskoryn-audio/opus"]
 
@@ -35,6 +35,9 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 bytes.workspace = true
+# Enumerate local interface addresses to show "this device: ip:port" while
+# discoverable (so a peer can connect by address). Only with a real backend.
+if-addrs = { version = "0.13", optional = true }
 
 [dev-dependencies]
 async-trait.workspace = true

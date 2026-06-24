@@ -57,6 +57,7 @@ struct App {
     peers: Vec<PeerStatus>,
     active: bool,
     port: u16,
+    local_addrs: Vec<String>, // this device's own dialable ip:port (for the manual fallback)
     transfers: Vec<(String, f32, u64)>,
 
     life: Lifecycle,
@@ -71,7 +72,6 @@ struct App {
     pair_phase: String, // idle | discoverable | connecting | prompt | paired | aborted | error
     pair_sas: String,
     pair_peer: String,
-    pair_listen: bool,
     pair_addr: String,
     nearby: Vec<DiscoveredPeer>, // devices on the LAN currently accepting pairing
 
@@ -98,7 +98,6 @@ enum Message {
     Forget(String),
     Acted(Result<Vec<UiEvent>, String>),
     // Pairing
-    PairRoleListen(bool),
     PairAddrChanged(String),
     PairStart,
     PairPoll,
@@ -124,6 +123,7 @@ impl App {
             peers: Vec::new(),
             active: false,
             port: 0,
+            local_addrs: Vec::new(),
             transfers: Vec::new(),
             life: Lifecycle::default(),
             bin: BinInfo { path: None, source: "none", exists: false },
@@ -135,7 +135,6 @@ impl App {
             pair_phase: "idle".into(),
             pair_sas: String::new(),
             pair_peer: String::new(),
-            pair_listen: true,
             pair_addr: String::new(),
             nearby: Vec::new(),
             arrangement: arranger::starter(),
@@ -181,11 +180,12 @@ impl App {
                 self.transfers.clear();
                 for ev in &events {
                     match ev {
-                        UiEvent::Status { device_name, peers, active, port } => {
+                        UiEvent::Status { device_name, peers, active, port, addrs } => {
                             self.device_name = device_name.clone();
                             self.peers = peers.clone();
                             self.active = *active;
                             self.port = *port;
+                            self.local_addrs = addrs.clone();
                         }
                         UiEvent::TransferProgress { name, fraction, bytes_per_sec, .. } => {
                             self.transfers.push((name.clone(), *fraction, *bytes_per_sec));
@@ -289,21 +289,18 @@ impl App {
                 }
                 Task::perform(ipc::request(UiRequest::Status), Message::StatusLoaded)
             }
-            Message::PairRoleListen(b) => {
-                self.pair_listen = b;
-                Task::none()
-            }
             Message::PairAddrChanged(s) => {
                 self.pair_addr = s;
                 Task::none()
             }
             Message::PairStart => {
-                // Empty addr = make discoverable (wait); else dial that peer.
-                let addr = if self.pair_listen { String::new() } else { self.pair_addr.clone() };
-                // Optimistically leave idle so the fast PairStatus poll starts
-                // immediately (the daemon's reply snapshot can race the handshake).
-                self.pair_phase = if self.pair_listen { "discoverable" } else { "connecting" }.into();
-                Task::perform(ipc::request(UiRequest::Pair { addr }), Message::PairLoaded)
+                // Make this device discoverable (the other side dials it).
+                // Optimistic phase so the fast PairStatus poll starts immediately.
+                self.pair_phase = "discoverable".into();
+                Task::perform(
+                    ipc::request(UiRequest::Pair { addr: String::new() }),
+                    Message::PairLoaded,
+                )
             }
             Message::PairPoll => {
                 Task::perform(ipc::request(UiRequest::PairStatus), Message::PairLoaded)
@@ -623,12 +620,23 @@ impl App {
                 .spacing(8),
             ]
             .spacing(10),
-            "discoverable" => column![
-                text("Pairing").size(16),
-                text("Waiting for a peer to connect...").size(14),
-                button("Cancel").on_press(Message::PairClear),
-            ]
-            .spacing(8),
+            "discoverable" => {
+                let mut c = column![
+                    text("Pairing").size(16),
+                    text("Waiting for a peer to connect...").size(14),
+                    text("On the other device, pick this one from its nearby list, or Connect by address:").size(12),
+                ]
+                .spacing(8);
+                if self.local_addrs.is_empty() {
+                    c = c.push(text("This device: (no routable address found)").size(14));
+                } else {
+                    c = c.push(text("This device:").size(13));
+                    for a in &self.local_addrs {
+                        c = c.push(text(a.clone()).size(14));
+                    }
+                }
+                c.push(button("Cancel").on_press(Message::PairClear))
+            }
             "connecting" => column![
                 text("Pairing").size(16),
                 text("Connecting...").size(14),
@@ -652,17 +660,27 @@ impl App {
             .spacing(8),
             // idle
             _ => {
-                let wait = button("Wait for a peer")
-                    .on_press(Message::PairRoleListen(true))
-                    .style(if self.pair_listen { button::primary } else { button::secondary });
-                let connect = button("Connect to a peer")
-                    .on_press(Message::PairRoleListen(false))
-                    .style(if self.pair_listen { button::secondary } else { button::primary });
                 let mut c = column![text("Pair a new device").size(16)].spacing(8);
 
-                // Nearby devices currently accepting pairing (auto-discovered).
+                // Pairing runs on the daemon's live endpoint, so it must be up
+                // (same requirement for discoverable and connect-by-address).
+                if !self.reachable {
+                    c = c.push(text("Start the daemon first (Connection tab) to pair.").size(12));
+                    c = c.push(button("Start pairing"));
+                    return c.into();
+                }
+
+                // Primary: make this device discoverable. The other side picks it
+                // from its nearby list (or connects by address below).
+                c = c.push(
+                    text("Make this device discoverable; on the other one, pick it from the nearby list. Then confirm the same 6-digit code on both.").size(12),
+                );
+                c = c.push(button("Start pairing").on_press(Message::PairStart).style(button::primary));
+
+                // Auto-discovered peers currently accepting pairing.
                 let nearby: Vec<_> = self.nearby.iter().filter(|p| !p.trusted).collect();
                 if !nearby.is_empty() {
+                    c = c.push(horizontal_rule(1));
                     c = c.push(text("Nearby - waiting to pair:").size(13));
                     for p in nearby {
                         c = c.push(
@@ -675,25 +693,23 @@ impl App {
                             .align_y(Alignment::Center),
                         );
                     }
-                    c = c.push(horizontal_rule(1));
                 }
 
-                c = c.push(text("Or pair manually - confirm the same 6-digit code on both machines.").size(12));
-                c = c.push(row![wait, connect].spacing(8));
-                if !self.pair_listen {
-                    c = c.push(
-                        text_input("192.168.1.42:7345", &self.pair_addr)
-                            .on_input(Message::PairAddrChanged),
-                    );
-                }
-                // The daemon performs pairing on its live endpoint, so it must be
-                // running and reachable.
-                if self.reachable {
-                    c = c.push(button("Start pairing").on_press(Message::PairStart));
+                // Fallback: connect by address (for LANs where mDNS can't find it).
+                c = c.push(horizontal_rule(1));
+                c = c.push(text("Connect by address (if not auto-discovered):").size(12));
+                let connect = if self.pair_addr.trim().is_empty() {
+                    button("Connect")
                 } else {
-                    c = c.push(text("Start the daemon first (Connection tab).").size(12));
-                    c = c.push(button("Start pairing"));
-                }
+                    button("Connect").on_press(Message::PairDial(self.pair_addr.clone()))
+                };
+                c = c.push(
+                    row![
+                        text_input("192.168.1.42:7345", &self.pair_addr).on_input(Message::PairAddrChanged),
+                        connect,
+                    ]
+                    .spacing(8),
+                );
                 c
             }
         };
