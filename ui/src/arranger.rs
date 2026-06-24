@@ -99,12 +99,32 @@ fn hex_to_bytes16(hex: &str) -> Vec<u8> {
 
 const SNAP: i32 = 60; // virtual px within which edges snap together
 const PAD: f32 = 24.0;
-const REF_WIDTH: f32 = 13_000.0; // virtual width the canvas scales to fit
 
-/// Stable virtual→screen transform (independent of tile positions, so dragging
-/// doesn't make the whole canvas jitter).
-fn scale_of(bounds: Rectangle) -> f32 {
-    ((bounds.width - 2.0 * PAD) / REF_WIDTH).max(0.001)
+/// Bounding box `(left, top, right, bottom)` of a virtual desktop, used as the
+/// frozen "fit box" the canvas scales to. `(0,0,0,0)` for an empty arrangement.
+pub fn bounding_box(tiles: &[MonTile]) -> (i32, i32, i32, i32) {
+    if tiles.is_empty() {
+        return (0, 0, 0, 0);
+    }
+    tiles.iter().fold((i32::MAX, i32::MAX, i32::MIN, i32::MIN), |(l, t, r, b), m| {
+        (l.min(m.x), t.min(m.y), r.max(m.x + m.w), b.max(m.y + m.h))
+    })
+}
+
+/// Virtual→screen transform that fits `fit` (a frozen bounding box) inside the
+/// gray canvas and centers it. Returns `(scale, offset_x, offset_y)` so a point
+/// maps to `(ox + x*scale, oy + y*scale)`. Frozen during a drag (the box is only
+/// recomputed on load/apply), so moving a tile doesn't make the canvas jitter.
+fn transform(bounds: Rectangle, fit: (i32, i32, i32, i32)) -> (f32, f32, f32) {
+    let (l, t, r, b) = fit;
+    let fw = (r - l).max(1) as f32;
+    let fh = (b - t).max(1) as f32;
+    let aw = (bounds.width - 2.0 * PAD).max(1.0);
+    let ah = (bounds.height - 2.0 * PAD).max(1.0);
+    let scale = (aw / fw).min(ah / fh).max(0.0001);
+    let ox = (bounds.width - fw * scale) / 2.0 - l as f32 * scale;
+    let oy = (bounds.height - fh * scale) / 2.0 - t as f32 * scale;
+    (scale, ox, oy)
 }
 
 /// Snap the moved tile's edges to nearby edges of the others.
@@ -167,12 +187,14 @@ pub struct Arranger<'a> {
     pub tiles: &'a [MonTile],
     /// When false (no peer connected), tiles are display-only: drags are ignored.
     pub editable: bool,
+    /// Frozen bounding box the canvas fits + centers (see [`transform`]).
+    pub fit: (i32, i32, i32, i32),
 }
 
 impl Arranger<'_> {
     fn to_virtual(&self, bounds: Rectangle, p: Point) -> (f32, f32) {
-        let s = scale_of(bounds);
-        ((p.x - PAD) / s, (p.y - PAD) / s)
+        let (s, ox, oy) = transform(bounds, self.fit);
+        ((p.x - ox) / s, (p.y - oy) / s)
     }
 
     fn tile_at(&self, vx: f32, vy: f32) -> Option<usize> {
@@ -242,7 +264,7 @@ impl canvas::Program<Message> for Arranger<'_> {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = Frame::new(renderer, bounds.size());
-        let s = scale_of(bounds);
+        let (s, ox, oy) = transform(bounds, self.fit);
         let local = Color::from_rgb8(0x1b, 0x5f, 0xa8);
         let peer = Color::from_rgb8(0x5a, 0x4f, 0xb0);
         let border = Color::from_rgb8(0xcc, 0xcc, 0xcc);
@@ -251,7 +273,7 @@ impl canvas::Program<Message> for Arranger<'_> {
         frame.fill_rectangle(Point::ORIGIN, bounds.size(), Color::from_rgb8(0xf0, 0xf2, 0xf5));
 
         for m in self.tiles {
-            let top_left = Point::new(PAD + m.x as f32 * s, PAD + m.y as f32 * s);
+            let top_left = Point::new(ox + m.x as f32 * s, oy + m.y as f32 * s);
             let size = Size::new(m.w as f32 * s, m.h as f32 * s);
             let rect = Path::rectangle(top_left, size);
             frame.fill(&rect, if m.dev == 0 { local } else { peer });

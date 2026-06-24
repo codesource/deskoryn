@@ -80,6 +80,8 @@ struct App {
     // Monitor arranger
     arrangement: Vec<MonTile>,
     selected_peer: Option<String>, // device id (hex) of the peer being arranged
+    arr_fit: (i32, i32, i32, i32), // frozen bounding box the canvas fits + centers
+    arr_dirty: bool,               // unsaved local edits (suppresses auto-refresh)
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +148,8 @@ impl App {
             nearby: Vec::new(),
             arrangement: Vec::new(),
             selected_peer: None,
+            arr_fit: (0, 0, 0, 0),
+            arr_dirty: false,
         };
         let proc = app.proc.clone();
         // Load the persisted binary override, then do a first refresh.
@@ -218,13 +222,18 @@ impl App {
                         None => true,
                     };
                     if has_peer {
-                        if stale {
+                        // Refresh when the selection went stale (peer connected /
+                        // dropped) or whenever there are no unsaved local edits, so
+                        // a layout the peer synced shows up live while the tab is
+                        // open. Skipped mid-edit so we never clobber a drag.
+                        if stale || !self.arr_dirty {
                             return self.load_arrangement();
                         }
                     } else {
                         // Solo: keep the read-only own-monitor display current.
                         self.selected_peer = None;
                         self.arrangement = arranger::tiles_from_views(&self.own_monitors);
+                        self.arr_fit = arranger::bounding_box(&self.arrangement);
                     }
                 }
                 Task::none()
@@ -418,6 +427,8 @@ impl App {
                     t.x = x;
                     t.y = y;
                 }
+                // Local edit: keep the view frozen (no jitter) and pause auto-refresh.
+                self.arr_dirty = true;
                 Task::none()
             }
             Message::ArrAlignTops => {
@@ -425,12 +436,17 @@ impl App {
                 for t in &mut self.arrangement {
                     t.y = top;
                 }
+                self.arr_dirty = true;
                 Task::none()
             }
             Message::ArrRevert => self.load_arrangement(),
             Message::ArrApply => {
                 let Some(peer) = self.selected_peer.clone() else { return Task::none() };
                 let layout = arranger::to_virtual_desktop(&self.arrangement, &self.device_id, &peer);
+                // Re-center the view on the just-applied arrangement, and clear the
+                // edit flag so live peer-synced updates resume.
+                self.arr_fit = arranger::bounding_box(&self.arrangement);
+                self.arr_dirty = false;
                 Task::perform(
                     ipc::request(UiRequest::SetLayout { peer, layout }),
                     Message::Acted,
@@ -446,6 +462,8 @@ impl App {
                 {
                     self.selected_peer = Some(peer);
                     self.arrangement = arranger::tiles_from_layout(&layout, &self.device_id);
+                    self.arr_fit = arranger::bounding_box(&self.arrangement);
+                    self.arr_dirty = false;
                 }
                 Task::none()
             }
@@ -473,6 +491,8 @@ impl App {
             None => {
                 // No peer connected: show this device's own monitors, read-only.
                 self.arrangement = arranger::tiles_from_views(&self.own_monitors);
+                self.arr_fit = arranger::bounding_box(&self.arrangement);
+                self.arr_dirty = false;
                 Task::none()
             }
         }
@@ -642,7 +662,7 @@ impl App {
         let connected: Vec<&PeerStatus> = self.peers.iter().filter(|p| p.connected).collect();
         let editable = !connected.is_empty();
 
-        let canvas = Canvas::new(arranger::Arranger { tiles: &self.arrangement, editable })
+        let canvas = Canvas::new(arranger::Arranger { tiles: &self.arrangement, editable, fit: self.arr_fit })
             .width(Length::Fill)
             .height(Length::Fixed(320.0));
 
