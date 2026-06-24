@@ -17,7 +17,7 @@ pub async fn run(config: Arc<AppConfig>, paths: Paths, dry_run: bool) -> anyhow:
     );
 
     if dry_run {
-        return run_dry(config).await;
+        return run_dry(config, paths.config_file()).await;
     }
 
     #[cfg(any(feature = "linux", feature = "windows"))]
@@ -458,6 +458,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                                         spawn_peer_dial(
                                                             endpoint2.clone(), addr, config2.clone(),
                                                             registry2.clone(), layouts2.clone(),
+                                                            paths2.config_file(),
                                                         );
                                                     }
                                                     return;
@@ -510,7 +511,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     }
 
     if config.network.discovery_enabled {
-        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts).await {
+        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts, paths.config_file()).await {
             Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),
             Err(e) => tracing::warn!(error = %e, "mDNS discovery unavailable"),
         }
@@ -534,8 +535,9 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         let config = config.clone();
                         let registry = registry_accept.clone();
                         let layouts = layouts_accept.clone();
+                        let config_path = paths_accept.config_file();
                         tokio::spawn(async move {
-                            if let Err(e) = crate::session::run(config, session, registry, layouts).await {
+                            if let Err(e) = crate::session::run(config, session, registry, layouts, config_path).await {
                                 tracing::warn!(error = %e, "inbound session ended");
                             }
                         });
@@ -583,7 +585,14 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     addrs.dedup();
 
     for addr_str in addrs {
-        spawn_peer_dial(endpoint.clone(), addr_str, config.clone(), registry.clone(), layouts.clone());
+        spawn_peer_dial(
+            endpoint.clone(),
+            addr_str,
+            config.clone(),
+            registry.clone(),
+            layouts.clone(),
+            paths.config_file(),
+        );
     }
 
     // The spawned loops do the work; park until shutdown.
@@ -602,6 +611,7 @@ fn spawn_peer_dial(
     config: Arc<AppConfig>,
     registry: crate::session::ConnRegistry,
     layouts: crate::session::LayoutStore,
+    config_path: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
         let mut backoff = Backoff::default();
@@ -610,8 +620,14 @@ fn spawn_peer_dial(
                 Ok(addr) => match endpoint.connect_any(addr).await {
                     Ok(session) => {
                         backoff = Backoff::default();
-                        if let Err(e) =
-                            crate::session::run(config.clone(), session, registry.clone(), layouts.clone()).await
+                        if let Err(e) = crate::session::run(
+                            config.clone(),
+                            session,
+                            registry.clone(),
+                            layouts.clone(),
+                            config_path.clone(),
+                        )
+                        .await
                         {
                             tracing::warn!(error = %e, peer = %addr_str, "session ended");
                         }
@@ -641,6 +657,7 @@ async fn start_discovery(
     discovered: &Arc<Discovered>,
     registry: &crate::session::ConnRegistry,
     layouts: &crate::session::LayoutStore,
+    config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     use deskoryn_net::discovery::{mdns::MdnsDiscovery, Discovery};
 
@@ -699,9 +716,10 @@ async fn start_discovery(
                     let active = active.clone();
                     let registry = registry.clone();
                     let layouts = layouts.clone();
+                    let config_path = config_path.clone();
                     let device = hint.device;
                     tokio::spawn(async move {
-                        if let Err(e) = crate::session::run(config, session, registry, layouts).await {
+                        if let Err(e) = crate::session::run(config, session, registry, layouts, config_path).await {
                             tracing::warn!(error = %e, "discovered session ended");
                         }
                         active.lock().await.remove(&device);
@@ -719,7 +737,7 @@ async fn start_discovery(
 
 /// Run the whole daemon in one process over a loopback session, with a synthetic
 /// peer. Exercises the orchestration without touching the OS or network.
-async fn run_dry(config: Arc<AppConfig>) -> anyhow::Result<()> {
+async fn run_dry(config: Arc<AppConfig>, config_path: std::path::PathBuf) -> anyhow::Result<()> {
     use deskoryn_net::transport::{loopback, Session};
     use deskoryn_proto::{Capabilities, PROTOCOL_VERSION};
 
@@ -780,7 +798,7 @@ async fn run_dry(config: Arc<AppConfig>) -> anyhow::Result<()> {
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let layouts: crate::session::LayoutStore =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
-    crate::session::run(config, Box::new(mine), registry, layouts).await?;
+    crate::session::run(config, Box::new(mine), registry, layouts, config_path).await?;
     let _ = peer_task.await;
     Ok(())
 }

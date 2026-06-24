@@ -55,6 +55,7 @@ pub async fn run(
     session: Box<dyn Session>,
     registry: ConnRegistry,
     layouts: LayoutStore,
+    config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     // Shared so the clipboard pump can open the FileXfer channel for file-paste
     // while the input pump keeps using the same session.
@@ -111,12 +112,14 @@ pub async fn run(
     }
     .unwrap_or_else(|| seed_layout(&own_monitors, &peer_monitors));
 
-    // Register this connection so the arranger can show the peer's monitors and
-    // push a re-arranged layout back to this session.
-    let (layout_tx, layout_rx) = mpsc::channel::<VirtualDesktop>(4);
+    // Layout wiring. `local_*` carries arranger applies from the IPC handler into
+    // the control pump (which broadcasts them to the peer); `apply_*` carries the
+    // effective layout — local or peer-synced — into the input pump's controller.
+    let (local_tx, local_rx) = mpsc::channel::<VirtualDesktop>(4);
+    let (apply_tx, apply_rx) = mpsc::channel::<VirtualDesktop>(4);
     {
         let mut reg = registry.lock().await;
-        reg.insert(peer, ConnInfo { monitors: peer_monitors.clone(), layout_tx });
+        reg.insert(peer, ConnInfo { monitors: peer_monitors.clone(), layout_tx: local_tx });
     }
 
     // Build the input controller over the combined virtual desktop, starting the
@@ -134,8 +137,21 @@ pub async fn run(
     // (capture -> forward / inject) for the lifetime of the session; whichever
     // ends first tears the session down so the supervisor can reconnect.
     tracing::info!(%peer, "session ready; starting pumps");
-    let control = crate::control::run_control(ctl_tx, ctl_rx, crate::control::HeartbeatConfig::default());
-    let input = crate::input::run_input(session.as_ref(), controller, capture, injector, layout_rx);
+    let layout_sync = crate::control::LayoutSync {
+        peer,
+        local_rx,
+        apply_tx,
+        layouts: layouts.clone(),
+        config: config.clone(),
+        config_path: config_path.clone(),
+    };
+    let control = crate::control::run_control(
+        ctl_tx,
+        ctl_rx,
+        crate::control::HeartbeatConfig::default(),
+        Some(layout_sync),
+    );
+    let input = crate::input::run_input(session.as_ref(), controller, capture, injector, apply_rx);
 
     // Clipboard sync (text + images on the Clipboard channel; files stream over
     // dedicated streams). Skipped entirely when all clipboard sync is disabled;

@@ -12,12 +12,34 @@
 //! faster than QUIC's idle timeout.
 
 use bytes::BytesMut;
+use deskoryn_core::config::AppConfig;
+use deskoryn_core::{DeviceId, VirtualDesktop};
 use deskoryn_net::transport::{Sink, Source};
 use deskoryn_proto::{decode_one, encode, Control};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
+
+/// Wiring that keeps the monitor arrangement in sync across a session.
+///
+/// A layout applied on either machine (via the arranger) is sent to the peer as
+/// a `LayoutUpdate`; the receiving side applies it to its focus controller and
+/// persists it, so both daemons converge on one shared virtual desktop.
+pub struct LayoutSync {
+    /// The connected peer (key for the saved arrangement).
+    pub peer: DeviceId,
+    /// Layouts applied locally (from the arranger) to broadcast + apply.
+    pub local_rx: mpsc::Receiver<VirtualDesktop>,
+    /// Forward an effective layout to the input pump (updates the controller).
+    pub apply_tx: mpsc::Sender<VirtualDesktop>,
+    /// In-memory saved per-peer layouts, updated on an inbound change.
+    pub layouts: crate::session::LayoutStore,
+    /// Full config + its path, to persist an inbound layout to disk.
+    pub config: Arc<AppConfig>,
+    pub config_path: PathBuf,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct HeartbeatConfig {
@@ -48,15 +70,54 @@ pub async fn run_control(
     sink: Box<dyn Sink>,
     source: Box<dyn Source>,
     hb: HeartbeatConfig,
+    sync: Option<LayoutSync>,
 ) -> anyhow::Result<ControlEnd> {
     let sink = Arc::new(Mutex::new(sink));
     let outstanding = Arc::new(AtomicU32::new(0));
 
-    // Reader: answer pings, reset liveness on pong, stop on goodbye/EOF.
+    // Split the layout-sync wiring: the reader handles inbound updates, the
+    // forwarder broadcasts locally-applied ones. Both push to the input pump.
+    let (local_rx, apply_tx, inbound) = match sync {
+        Some(s) => (
+            Some(s.local_rx),
+            Some(s.apply_tx.clone()),
+            Some(InboundLayout {
+                peer: s.peer,
+                apply_tx: s.apply_tx,
+                layouts: s.layouts,
+                config: s.config,
+                config_path: s.config_path,
+            }),
+        ),
+        None => (None, None, None),
+    };
+
+    // Reader: answer pings, reset liveness on pong, stop on goodbye/EOF, and
+    // apply+persist inbound layout updates.
     let mut reader = {
         let sink = sink.clone();
         let outstanding = outstanding.clone();
-        tokio::spawn(async move { read_loop(source, sink, outstanding).await })
+        tokio::spawn(async move { read_loop(source, sink, outstanding, inbound).await })
+    };
+
+    // Forwarder: broadcast a locally-applied layout to the peer, then apply it
+    // to our own controller. Parks forever once the channel closes (or absent).
+    let forwarder = {
+        let sink = sink.clone();
+        async move {
+            if let Some(mut rx) = local_rx {
+                while let Some(vd) = rx.recv().await {
+                    let mut out = BytesMut::new();
+                    if encode(&Control::LayoutUpdate { layout: vd.clone() }, &mut out).is_ok() {
+                        let _ = sink.lock().await.send_bytes(&out).await;
+                    }
+                    if let Some(tx) = &apply_tx {
+                        let _ = tx.send(vd).await;
+                    }
+                }
+            }
+            std::future::pending::<()>().await
+        }
     };
 
     // Ticker: send pings, declare death after `max_missed` unanswered.
@@ -83,15 +144,28 @@ pub async fn run_control(
     let outcome = tokio::select! {
         r = &mut reader => r.unwrap_or_else(|e| Err(anyhow::anyhow!(e))),
         t = ticker => t.map(|_| ControlEnd::Eof),
+        // Never resolves (forwarder parks); present so it runs for the session.
+        _ = forwarder => Ok(ControlEnd::Eof),
     };
     reader.abort();
     outcome
+}
+
+/// Inbound-layout handling for [`read_loop`]: apply to the controller and
+/// persist under the peer.
+struct InboundLayout {
+    peer: DeviceId,
+    apply_tx: mpsc::Sender<VirtualDesktop>,
+    layouts: crate::session::LayoutStore,
+    config: Arc<AppConfig>,
+    config_path: PathBuf,
 }
 
 async fn read_loop(
     mut source: Box<dyn Source>,
     sink: Arc<Mutex<Box<dyn Sink>>>,
     outstanding: Arc<AtomicU32>,
+    inbound: Option<InboundLayout>,
 ) -> anyhow::Result<ControlEnd> {
     loop {
         let frame = match source.recv_bytes().await {
@@ -114,9 +188,19 @@ async fn read_loop(
                 tracing::info!(%reason, "peer said goodbye");
                 return Ok(ControlEnd::Goodbye);
             }
-            Ok(Some(Control::LayoutUpdate { .. })) => {
-                // TODO(impl): forward to the focus machine to rebuild the desktop.
-                tracing::debug!("received layout update");
+            Ok(Some(Control::LayoutUpdate { layout })) => {
+                tracing::info!(monitors = layout.monitors.len(), "received layout update from peer");
+                if let Some(ib) = &inbound {
+                    // Apply to our controller and persist under the peer so the
+                    // two daemons stay on one shared arrangement across restarts.
+                    let _ = ib.apply_tx.send(layout.clone()).await;
+                    ib.layouts.lock().await.insert(ib.peer, layout.clone());
+                    let mut cfg = (*ib.config).clone();
+                    cfg.set_layout_for(ib.peer, layout);
+                    if let Err(e) = cfg.save(&ib.config_path) {
+                        tracing::warn!(error = %e, "failed to persist synced layout");
+                    }
+                }
             }
             Ok(Some(other)) => tracing::debug!(?other, "control message"),
             Ok(None) => {}
@@ -145,8 +229,8 @@ mod tests {
         let (ta, ra) = a.channel(Channel::Control).await.unwrap();
         let (tb, rb) = b.channel(Channel::Control).await.unwrap();
 
-        let mut pa = tokio::spawn(run_control(ta, ra, fast_hb()));
-        let mut pb = tokio::spawn(run_control(tb, rb, fast_hb()));
+        let mut pa = tokio::spawn(run_control(ta, ra, fast_hb(), None));
+        let mut pb = tokio::spawn(run_control(tb, rb, fast_hb(), None));
 
         // Over ~10 heartbeat intervals neither side should declare the other dead.
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -166,7 +250,7 @@ mod tests {
         let _b_keepalive = b.channel(Channel::Control).await.unwrap();
         let _b = b;
 
-        let result = tokio::time::timeout(Duration::from_secs(2), run_control(ta, ra, fast_hb())).await;
+        let result = tokio::time::timeout(Duration::from_secs(2), run_control(ta, ra, fast_hb(), None)).await;
         let inner = result.expect("should resolve well before the 2s bound");
         assert!(inner.is_err(), "an unresponsive peer must trip the heartbeat timeout");
     }
@@ -177,7 +261,7 @@ mod tests {
         let (ta, ra) = a.channel(Channel::Control).await.unwrap();
         let (mut tb, _rb) = b.channel(Channel::Control).await.unwrap();
 
-        let pump = tokio::spawn(run_control(ta, ra, fast_hb()));
+        let pump = tokio::spawn(run_control(ta, ra, fast_hb(), None));
 
         // Peer immediately says goodbye.
         let mut out = BytesMut::new();
