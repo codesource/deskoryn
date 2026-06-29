@@ -213,6 +213,10 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     // updates it over IPC; each session seeds its controller from it on connect.
     let edge: crate::session::EdgeResistance =
         Arc::new(std::sync::atomic::AtomicI32::new(config.input.edge_resistance_px.max(0)));
+    // Live feature toggles (clipboard / audio / input sharing), seeded from
+    // config. The Settings tab flips them over IPC; each session reads them at
+    // connect, so a change is applied by bouncing connected sessions.
+    let features: crate::session::Features = crate::session::FeatureState::from_config(&config);
 
     // Local control channel for the tray UI / `deskorynd status` (Unix domain
     // socket on Unix/macOS, named pipe on Windows).
@@ -233,6 +237,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let registry_ipc = registry.clone();
         let layouts_ipc = layouts.clone();
         let edge_ipc = edge.clone();
+        let features_ipc = features.clone();
         let device_id = config.device.id;
 
         // Map a pairing snapshot to the wire event.
@@ -278,7 +283,9 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             device_id: deskoryn_core::DeviceId,
             port: u16,
             edge_resistance_px: i32,
+            features: &crate::session::Features,
         ) -> Vec<UiEvent> {
+            use std::sync::atomic::Ordering;
             let connected: std::collections::HashSet<deskoryn_core::DeviceId> =
                 registry.lock().await.keys().copied().collect();
             let t = trust.lock().await;
@@ -305,6 +312,9 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                 addrs: local_addrs(port),
                 monitors,
                 edge_resistance_px,
+                clipboard_sync: features.clipboard.load(Ordering::Relaxed),
+                audio_forward: features.audio.load(Ordering::Relaxed),
+                input_sharing: features.input_sharing.load(Ordering::Relaxed),
             }]
         }
 
@@ -320,12 +330,13 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             let registry = registry_ipc.clone();
             let layouts = layouts_ipc.clone();
             let edge = edge_ipc.clone();
+            let features = features_ipc.clone();
             Box::pin(async move {
                 use std::sync::atomic::Ordering;
                 match req {
                     UiRequest::Status => {
                         let px = edge.load(Ordering::Relaxed);
-                        status(&trust, &registry, device_name, device_id, listen_port, px).await
+                        status(&trust, &registry, device_name, device_id, listen_port, px, &features).await
                     }
                     UiRequest::Arrangement { peer } => {
                         // Look up the connected peer for its real monitors; build
@@ -370,7 +381,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                             let _ = info.layout_tx.send(layout).await;
                         }
                         let px = edge.load(Ordering::Relaxed);
-                        status(&trust, &registry, device_name, device_id, listen_port, px).await
+                        status(&trust, &registry, device_name, device_id, listen_port, px, &features).await
                     }
                     UiRequest::SetEdgeResistance { px } => {
                         let px = px.max(0);
@@ -386,7 +397,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         for info in registry.lock().await.values() {
                             let _ = info.edge_tx.send(px).await;
                         }
-                        status(&trust, &registry, device_name, device_id, listen_port, px).await
+                        status(&trust, &registry, device_name, device_id, listen_port, px, &features).await
                     }
                     UiRequest::DiscoveredPeers => {
                         use crate::ipc::DiscoveredPeer;
@@ -458,6 +469,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                     let registry2 = registry.clone();
                                     let layouts2 = layouts.clone();
                                     let edge2 = edge.clone();
+                                    let features2 = features.clone();
                                     tokio::spawn(async move {
                                         let mut last_err = String::from("no address");
                                         for cand in &candidates {
@@ -486,7 +498,8 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                                                         spawn_peer_dial(
                                                             endpoint2.clone(), addr, config2.clone(),
                                                             registry2.clone(), layouts2.clone(),
-                                                            edge2.clone(), paths2.config_file(),
+                                                            edge2.clone(), features2.clone(),
+                                                            paths2.config_file(),
                                                         );
                                                     }
                                                     return;
@@ -524,9 +537,43 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         }
                         // Return a fresh snapshot so the UI updates immediately.
                         let px = edge.load(Ordering::Relaxed);
-                        status(&trust, &registry, device_name, device_id, listen_port, px).await
+                        status(&trust, &registry, device_name, device_id, listen_port, px, &features).await
                     }
-                    _ => vec![],
+                    UiRequest::SetFeature { feature, enabled } => {
+                        use crate::ipc::Feature;
+                        // Flip the live shared flag and mirror it into a config
+                        // clone to persist. Clipboard is a master over the three
+                        // per-type flags (the UI exposes a single toggle).
+                        let mut cfg = (*config).clone();
+                        match feature {
+                            Feature::ClipboardSync => {
+                                features.clipboard.store(enabled, Ordering::Relaxed);
+                                cfg.clipboard.sync_text = enabled;
+                                cfg.clipboard.sync_images = enabled;
+                                cfg.clipboard.sync_files = enabled;
+                            }
+                            Feature::AudioForward => {
+                                features.audio.store(enabled, Ordering::Relaxed);
+                                cfg.audio.forward_enabled = enabled;
+                            }
+                            Feature::InputSharing => {
+                                features.input_sharing.store(enabled, Ordering::Relaxed);
+                                cfg.input.sharing_enabled = enabled;
+                            }
+                        }
+                        if let Err(e) = cfg.save(&paths.config_file()) {
+                            tracing::warn!(error = %e, "failed to persist feature toggle");
+                        }
+                        // Capabilities are fixed at the handshake, so bounce every
+                        // connected session; the dial/accept loops re-dial and the
+                        // next Hello advertises the new feature set.
+                        for info in registry.lock().await.values() {
+                            info.cancel.notify_waiters();
+                        }
+                        tracing::info!(?feature, enabled, "feature toggled; bounced live sessions");
+                        let px = edge.load(Ordering::Relaxed);
+                        status(&trust, &registry, device_name, device_id, listen_port, px, &features).await
+                    }
                 }
             }) as HandlerFuture
         });
@@ -540,7 +587,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
     }
 
     if config.network.discovery_enabled {
-        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts, &edge, paths.config_file()).await {
+        match start_discovery(&config, &endpoint, &trust, identity_fp, &pairing, &discovered, &registry, &layouts, &edge, &features, paths.config_file()).await {
             Ok(()) => tracing::info!(name = %config.device.name, "advertising on mDNS"),
             Err(e) => tracing::warn!(error = %e, "mDNS discovery unavailable"),
         }
@@ -557,6 +604,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
         let registry_accept = registry.clone();
         let layouts_accept = layouts.clone();
         let edge_accept = edge.clone();
+        let features_accept = features.clone();
         tokio::spawn(async move {
             use deskoryn_net::quic::Accepted;
             loop {
@@ -566,9 +614,10 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
                         let registry = registry_accept.clone();
                         let layouts = layouts_accept.clone();
                         let edge = edge_accept.clone();
+                        let features = features_accept.clone();
                         let config_path = paths_accept.config_file();
                         tokio::spawn(async move {
-                            if let Err(e) = crate::session::run(config, session, registry, layouts, edge, config_path).await {
+                            if let Err(e) = crate::session::run(config, session, registry, layouts, edge, features, config_path).await {
                                 tracing::warn!(error = %e, "inbound session ended");
                             }
                         });
@@ -623,6 +672,7 @@ async fn run_real(config: Arc<AppConfig>, paths: Paths) -> anyhow::Result<()> {
             registry.clone(),
             layouts.clone(),
             edge.clone(),
+            features.clone(),
             paths.config_file(),
         );
     }
@@ -644,6 +694,7 @@ fn spawn_peer_dial(
     registry: crate::session::ConnRegistry,
     layouts: crate::session::LayoutStore,
     edge: crate::session::EdgeResistance,
+    features: crate::session::Features,
     config_path: std::path::PathBuf,
 ) {
     tokio::spawn(async move {
@@ -659,6 +710,7 @@ fn spawn_peer_dial(
                             registry.clone(),
                             layouts.clone(),
                             edge.clone(),
+                            features.clone(),
                             config_path.clone(),
                         )
                         .await
@@ -692,6 +744,7 @@ async fn start_discovery(
     registry: &crate::session::ConnRegistry,
     layouts: &crate::session::LayoutStore,
     edge: &crate::session::EdgeResistance,
+    features: &crate::session::Features,
     config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     use deskoryn_net::discovery::{mdns::MdnsDiscovery, Discovery};
@@ -710,6 +763,7 @@ async fn start_discovery(
     let registry = registry.clone();
     let layouts = layouts.clone();
     let edge = edge.clone();
+    let features = features.clone();
     // Peers we already have a session with (or are dialing), so repeated mDNS
     // re-resolutions don't spawn a storm of duplicate connections.
     let active: Arc<tokio::sync::Mutex<std::collections::HashSet<deskoryn_core::DeviceId>>> =
@@ -753,10 +807,11 @@ async fn start_discovery(
                     let registry = registry.clone();
                     let layouts = layouts.clone();
                     let edge = edge.clone();
+                    let features = features.clone();
                     let config_path = config_path.clone();
                     let device = hint.device;
                     tokio::spawn(async move {
-                        if let Err(e) = crate::session::run(config, session, registry, layouts, edge, config_path).await {
+                        if let Err(e) = crate::session::run(config, session, registry, layouts, edge, features, config_path).await {
                             tracing::warn!(error = %e, "discovered session ended");
                         }
                         active.lock().await.remove(&device);
@@ -837,7 +892,8 @@ async fn run_dry(config: Arc<AppConfig>, config_path: std::path::PathBuf) -> any
         Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
     let edge: crate::session::EdgeResistance =
         Arc::new(std::sync::atomic::AtomicI32::new(config.input.edge_resistance_px.max(0)));
-    crate::session::run(config, Box::new(mine), registry, layouts, edge, config_path).await?;
+    let features: crate::session::Features = crate::session::FeatureState::from_config(&config);
+    crate::session::run(config, Box::new(mine), registry, layouts, edge, features, config_path).await?;
     let _ = peer_task.await;
     Ok(())
 }

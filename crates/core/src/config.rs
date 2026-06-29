@@ -126,6 +126,11 @@ impl Default for NetworkConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputConfig {
+    /// Master switch for cross-machine input forwarding. When false, this
+    /// machine keeps its cursor/keyboard local (the controller starts locked):
+    /// no hand-off out to a peer. Toggled live from the tray's Settings tab.
+    #[serde(default = "default_true")]
+    pub sharing_enabled: bool,
     /// Keyboard focus follows the mouse across the machine boundary.
     pub focus_follows_mouse: bool,
     /// Soft wall before the cursor crosses to the *other machine*: the pixels of
@@ -144,6 +149,7 @@ pub struct InputConfig {
 impl Default for InputConfig {
     fn default() -> Self {
         Self {
+            sharing_enabled: true,
             focus_follows_mouse: true,
             edge_resistance_px: 0,
             switch_hotkey: "Ctrl+Alt+S".into(),
@@ -165,6 +171,10 @@ pub struct ClipboardConfig {
     /// polls; lower = snappier paste, higher = less idle wakeups.
     #[serde(default = "default_poll_ms")]
     pub poll_ms: u64,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_poll_ms() -> u64 {

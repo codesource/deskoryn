@@ -52,6 +52,12 @@ pub enum UiEvent {
         monitors: Vec<MonitorView>,
         #[serde(default)]
         edge_resistance_px: i32,
+        #[serde(default)]
+        clipboard_sync: bool,
+        #[serde(default)]
+        audio_forward: bool,
+        #[serde(default)]
+        input_sharing: bool,
     },
     Arrangement {
         peer: String,

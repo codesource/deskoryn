@@ -35,7 +35,6 @@ pub fn main() -> iced::Result {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Screen {
     Status,
-    Connection,
     Arranger,
     Devices,
     Transfers,
@@ -201,7 +200,7 @@ impl App {
                 self.transfers.clear();
                 for ev in &events {
                     match ev {
-                        UiEvent::Status { device_name, device_id, peers, active, port, addrs, monitors, edge_resistance_px } => {
+                        UiEvent::Status { device_name, device_id, peers, active, port, addrs, monitors, edge_resistance_px, clipboard_sync, audio_forward, input_sharing } => {
                             self.device_name = device_name.clone();
                             self.device_id = device_id.clone();
                             self.peers = peers.clone();
@@ -210,6 +209,13 @@ impl App {
                             self.port = *port;
                             self.local_addrs = addrs.clone();
                             self.edge_resistance_px = *edge_resistance_px;
+                            // Reflect the daemon's real feature state in the
+                            // Settings toggles (was static defaults before).
+                            self.features = Features {
+                                input: *input_sharing,
+                                clipboard: *clipboard_sync,
+                                audio: *audio_forward,
+                            };
                             // Seed the editable field on first load; afterwards leave
                             // whatever the user has typed so a 2s poll never clobbers
                             // an in-progress edit.
@@ -527,7 +533,6 @@ impl App {
     fn view(&self) -> Element<'_, Message> {
         let content = match self.screen {
             Screen::Status => self.view_status(),
-            Screen::Connection => self.view_connection(),
             Screen::Arranger => self.view_arranger(),
             Screen::Devices => self.view_devices(),
             Screen::Transfers => self.view_transfers(),
@@ -550,25 +555,40 @@ impl App {
                 b.style(button::text)
             }
         };
+        // A short, plain-language summary of what the workstation is doing.
         let dot = if !self.reachable {
-            "daemon offline"
+            "Daemon not running"
         } else if self.peers.iter().any(|p| p.connected) {
-            if self.active { "connected" } else { "connected (paused)" }
+            if self.active { "Connected and active" } else { "Connected - input paused" }
         } else {
-            "searching..."
+            "Ready - looking for devices"
+        };
+        // Daemon start/stop lives here so it's reachable from every tab. The
+        // button reflects (and toggles) the live process: Start when stopped,
+        // Stop when running. Start is disabled until a binary is resolved.
+        let running = self.life.running;
+        let power = if running {
+            button(text("Stop daemon").size(14))
+                .width(Length::Fill)
+                .on_press(Message::StopDaemon)
+                .style(button::danger)
+        } else {
+            let b = button(text("Start daemon").size(14)).width(Length::Fill).style(button::primary);
+            if self.bin.exists { b.on_press(Message::StartDaemon) } else { b }
         };
         column![
             text("Deskoryn").size(20),
             Space::with_height(8),
             nav("Status", Screen::Status, self.screen),
-            nav("Connection", Screen::Connection, self.screen),
-            nav("Arrange monitors", Screen::Arranger, self.screen),
+            nav("Monitors", Screen::Arranger, self.screen),
             nav("Devices", Screen::Devices, self.screen),
             nav("Transfers", Screen::Transfers, self.screen),
             nav("Settings", Screen::Settings, self.screen),
             Space::with_height(Length::Fill),
             text(dot.to_string()).size(12),
             text(self.toast.clone().unwrap_or_default()).size(11),
+            Space::with_height(8),
+            power,
         ]
         .spacing(4)
         .padding(12)
@@ -587,10 +607,18 @@ impl App {
         .spacing(10);
 
         if !self.reachable {
-            col = col.push(text("The deskorynd daemon isn't reachable.").size(13));
-            col = col.push(text("Start it from the Connection tab.").size(12));
+            col = col.push(text("The deskorynd daemon isn't running.").size(13));
+            col = col.push(text("Start it with the button at the bottom of the sidebar.").size(12));
             return col.into();
         }
+        // Daemon state + listening port, so the most-watched tab shows whether
+        // the workstation is up and which port peers reach it on.
+        let daemon_line = if self.port != 0 {
+            format!("Daemon running - listening on port {}", self.port)
+        } else {
+            "Daemon running".to_string()
+        };
+        col = col.push(text(daemon_line).size(13));
         let connected = self.peers.iter().filter(|p| p.connected).count();
         col = col.push(text(format!("{connected} of {} devices connected", self.peers.len())).size(13));
         if self.peers.is_empty() {
@@ -613,30 +641,13 @@ impl App {
         col.into()
     }
 
-    fn view_connection(&self) -> Element<'_, Message> {
+    /// Connection configuration shown on the Settings screen: the optional
+    /// start-time daemon args (manual peer, listen port) and which `deskorynd`
+    /// binary the tray launches. The daemon is symmetric (it listens AND
+    /// auto-connects to paired peers found via mDNS), so these are only needed
+    /// on networks without mDNS or to pin a port/binary.
+    fn connection_settings(&self) -> Element<'_, Message> {
         let running = self.life.running;
-
-        // Daemon lifecycle. The daemon is symmetric: it listens AND auto-connects
-        // to paired peers found on the LAN via mDNS - no client/server split.
-        let state = if running {
-            if self.port != 0 {
-                format!("running - listening on port {}", self.port)
-            } else {
-                "running".to_string()
-            }
-        } else {
-            "stopped".to_string()
-        };
-        let start = if running || !self.bin.exists {
-            button("Start daemon")
-        } else {
-            button("Start daemon").on_press(Message::StartDaemon)
-        };
-        let stop = if running {
-            button("Stop").on_press(Message::StopDaemon).style(button::danger)
-        } else {
-            button("Stop").style(button::danger)
-        };
 
         // Optional advanced fields, locked while running (they're start-time args).
         let peer_field = text_input("auto-discovered via mDNS (optional)", &self.manual_peer);
@@ -645,12 +656,10 @@ impl App {
         let port_field = if running { port_field } else { port_field.on_input(Message::PortChanged) };
 
         let daemon = column![
-            text("Daemon").size(18),
-            text(state).size(13),
+            text("Connection").size(18),
             text("Paired devices on the LAN connect automatically (mDNS). Both ends just run.").size(12),
-            row![start, stop].spacing(8),
+            text("Changes apply next time the daemon starts (sidebar button).").size(11),
             Space::with_height(6),
-            text("Advanced").size(13),
             row![text("Manual peer").width(Length::Fixed(110.0)), peer_field].spacing(8).align_y(Alignment::Center),
             text("Only needed on networks without mDNS (host:port).").size(11),
             row![text("Listen port").width(Length::Fixed(110.0)), port_field].spacing(8).align_y(Alignment::Center),
@@ -675,13 +684,7 @@ impl App {
         ]
         .spacing(8);
 
-        column![
-            daemon,
-            horizontal_rule(1),
-            binp,
-        ]
-        .spacing(16)
-        .into()
+        column![daemon, horizontal_rule(1), binp].spacing(16).into()
     }
 
     /// The edge-resistance ("soft wall") editor shown on the arranger screen. A
@@ -885,7 +888,7 @@ impl App {
                 // Pairing runs on the daemon's live endpoint, so it must be up
                 // (same requirement for discoverable and connect-by-address).
                 if !self.reachable {
-                    c = c.push(text("Start the daemon first (Connection tab) to pair.").size(12));
+                    c = c.push(text("Start the daemon first (sidebar button) to pair.").size(12));
                     c = c.push(button("Start pairing"));
                     return c.into();
                 }
@@ -968,14 +971,18 @@ impl App {
         };
         let mut col = column![text("Features").size(18)].spacing(10);
         if !reachable {
-            col = col.push(text("Start the daemon (Connection tab) to change features.").size(12));
+            col = col.push(text("Start the daemon (sidebar button) to change features.").size(12));
         }
-        col.push(toggle("Input sharing", self.features.input, Feature::InputSharing))
+        let features = col
+            .push(toggle("Input sharing", self.features.input, Feature::InputSharing))
             .push(toggle("Clipboard sync", self.features.clipboard, Feature::ClipboardSync))
             .push(toggle("Audio forwarding", self.features.audio, Feature::AudioForward))
             .push(horizontal_rule(1))
-            .push(text("Input, Clipboard, Files, Network, Startup groups mirror config.toml;").size(12))
-            .push(text("editing them lives in config.toml until the daemon exposes config over IPC.").size(12))
+            .push(text("Other settings (Files, Network, Startup) live in config.toml").size(12))
+            .push(text("until the daemon exposes them over IPC.").size(12));
+
+        column![features, horizontal_rule(1), self.connection_settings()]
+            .spacing(16)
             .into()
     }
 }

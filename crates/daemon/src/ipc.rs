@@ -82,6 +82,14 @@ pub enum UiEvent {
         /// arranger can show and edit it.
         #[serde(default)]
         edge_resistance_px: i32,
+        /// Current feature toggles, so the Settings tab reflects the daemon's
+        /// real state instead of static defaults.
+        #[serde(default)]
+        clipboard_sync: bool,
+        #[serde(default)]
+        audio_forward: bool,
+        #[serde(default)]
+        input_sharing: bool,
     },
     /// The monitor arrangement for one peer (reply to [`UiRequest::Arrangement`]).
     Arrangement {
@@ -324,6 +332,9 @@ mod tests {
                         addrs: vec![],
                         monitors: vec![],
                         edge_resistance_px: 0,
+                        clipboard_sync: true,
+                        audio_forward: false,
+                        input_sharing: true,
                     }],
                     _ => vec![],
                 }

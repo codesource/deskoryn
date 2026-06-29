@@ -95,6 +95,14 @@ impl Controller {
         self
     }
 
+    /// Start with transitions locked off (input sharing disabled). The cursor
+    /// stays on this machine until unlocked (via the lock hotkey or a session
+    /// bounce after the feature is re-enabled). See [`Self::locked`].
+    pub fn with_locked(mut self, locked: bool) -> Self {
+        self.locked = locked;
+        self
+    }
+
     /// Provide this machine's monitors in local OS coordinates, so an incoming
     /// `Enter` can warp the real cursor to the exact crossing point.
     pub fn with_local_monitors(mut self, local: Vec<Monitor>) -> Self {

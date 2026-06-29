@@ -15,9 +15,9 @@ use deskoryn_core::DeviceId;
 use deskoryn_net::transport::Session;
 use deskoryn_proto::{Channel, Control, PROTOCOL_VERSION};
 use std::collections::HashMap;
-use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 /// Live info about one connected peer, shared with the IPC/arranger so the UI can
 /// show the peer's real monitors and push a new arrangement to the live session.
@@ -29,7 +29,42 @@ pub struct ConnInfo {
     /// Push a new edge-resistance value (px) to this session's input pump. Unlike
     /// the layout, this is a local-only preference and is not synced to the peer.
     pub edge_tx: mpsc::Sender<i32>,
+    /// Bounce this session: notifying it ends the pumps so the supervisor
+    /// re-dials and the next session renegotiates capabilities with the current
+    /// [`FeatureState`]. Used when a feature is toggled from the Settings tab —
+    /// clipboard/audio/input caps are fixed at connect, so a live flip needs a
+    /// reconnect to take effect.
+    pub cancel: Arc<Notify>,
 }
+
+/// Live feature toggles, shared between the IPC handler (which flips them from
+/// the Settings tab and persists them to config) and each session (which reads
+/// them at connect to decide capabilities + which pumps to run). Mirrors
+/// [`EdgeResistance`]: a session reads these once at startup, so a change is
+/// applied by bouncing connected sessions (see [`ConnInfo::cancel`]).
+#[derive(Debug)]
+pub struct FeatureState {
+    /// Clipboard sync (text/images/files) on this machine.
+    pub clipboard: AtomicBool,
+    /// Audio forwarding from this machine.
+    pub audio: AtomicBool,
+    /// Cross-machine input forwarding from this machine.
+    pub input_sharing: AtomicBool,
+}
+
+impl FeatureState {
+    /// Seed from config at startup.
+    pub fn from_config(cfg: &AppConfig) -> Arc<Self> {
+        let clip = cfg.clipboard.sync_text || cfg.clipboard.sync_images || cfg.clipboard.sync_files;
+        Arc::new(Self {
+            clipboard: AtomicBool::new(clip),
+            audio: AtomicBool::new(cfg.audio.forward_enabled),
+            input_sharing: AtomicBool::new(cfg.input.sharing_enabled),
+        })
+    }
+}
+
+pub type Features = Arc<FeatureState>;
 
 /// The live edge-resistance soft wall (px), shared between the IPC handler (which
 /// updates it from the arranger and persists it) and each session (which seeds
@@ -66,6 +101,7 @@ pub async fn run(
     registry: ConnRegistry,
     layouts: LayoutStore,
     edge: EdgeResistance,
+    features: Features,
     config_path: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     // Shared so the clipboard pump can open the FileXfer channel for file-paste
@@ -96,7 +132,7 @@ pub async fn run(
         device: config.device.id,
         name: config.device.name.clone(),
         monitors: VirtualDesktop::new(own_monitors.clone()),
-        capabilities: capabilities_from(&config),
+        capabilities: capabilities_from(&config, &features),
     };
     deskoryn_proto::encode(&hello, &mut buf)?;
     ctl_tx.send_bytes(&buf).await?;
@@ -130,11 +166,19 @@ pub async fn run(
     let (apply_tx, apply_rx) = mpsc::channel::<VirtualDesktop>(4);
     // Edge-resistance changes (local-only) flow straight into the input pump.
     let (edge_tx, edge_rx) = mpsc::channel::<i32>(4);
+    // Bounce handle: the IPC handler notifies this to drop the session and force
+    // a reconnect when a feature toggle changes our advertised capabilities.
+    let cancel = Arc::new(Notify::new());
     {
         let mut reg = registry.lock().await;
         reg.insert(
             peer,
-            ConnInfo { monitors: peer_monitors.clone(), layout_tx: local_tx, edge_tx },
+            ConnInfo {
+                monitors: peer_monitors.clone(),
+                layout_tx: local_tx,
+                edge_tx,
+                cancel: cancel.clone(),
+            },
         );
     }
 
@@ -143,6 +187,9 @@ pub async fn run(
     let start = start_position(&layout, config.device.id);
     let mut controller = crate::input::Controller::new(layout, config.device.id, start)
         .with_input_config(&config.input)
+        // Start locked when input sharing is off: the cursor stays on this
+        // machine (no hand-off out) until the feature is re-enabled.
+        .with_locked(!features.input_sharing.load(Ordering::Relaxed))
         // Our detected monitors (local OS coords) let an incoming Enter warp the
         // cursor to exactly where the pointer crossed in.
         .with_local_monitors(own_monitors.clone());
@@ -179,10 +226,14 @@ pub async fn run(
     // dedicated streams). Skipped entirely when all clipboard sync is disabled;
     // with the portable/no-op backend the pump simply parks (idle stream).
     let clip = &config.clipboard;
+    // The Settings master toggle gates all clipboard sync; per-type config flags
+    // still select which formats sync when the master is on.
+    let clip_master = features.clipboard.load(Ordering::Relaxed);
+    let sync_files = clip_master && clip.sync_files;
     type PumpFuture = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
     type ClipAccess = std::sync::Arc<dyn deskoryn_clipboard::ClipboardAccess>;
     let (clip_access, clipboard): (Option<ClipAccess>, PumpFuture) =
-        if clip.sync_text || clip.sync_images || clip.sync_files {
+        if clip_master && (clip.sync_text || clip.sync_images || clip.sync_files) {
             let (clip_sink, clip_source) = session.channel(Channel::Clipboard).await?;
             let (access, clip_changes) = deskoryn_clipboard::platform::open_access(
                 std::time::Duration::from_millis(clip.poll_ms),
@@ -194,7 +245,7 @@ pub async fn run(
                 clip_source,
                 clip.inline_max_bytes,
                 session.clone(),
-                clip.sync_files,
+                sync_files,
             ));
             (Some(access), fut)
         } else {
@@ -203,7 +254,7 @@ pub async fn run(
 
     // Dispatcher: accepts dedicated streams (file transfers + clipboard
     // file-paste) for the session lifetime, each handled concurrently.
-    let download = clip.sync_files.then(|| {
+    let download = sync_files.then(|| {
         (
             config
                 .file_transfer
@@ -228,7 +279,7 @@ pub async fn run(
     let audio: PumpFuture = Box::pin(crate::audio::run_audio_pump(
         session.clone(),
         config.audio.profile,
-        config.audio.forward_enabled,
+        features.audio.load(Ordering::Relaxed),
         peer_forwards_audio,
     ));
 
@@ -238,6 +289,9 @@ pub async fn run(
         r = clipboard => { r.map(|_| "clipboard pump ended".to_string()) }
         r = dispatcher => { r.map(|_| "stream dispatcher ended".to_string()) }
         r = audio => { r.map(|_| "audio pump ended".to_string()) }
+        // A feature toggle bounced us: end the session so the supervisor re-dials
+        // and the next handshake advertises the new capabilities.
+        _ = cancel.notified() => { Ok("bounced for feature change".to_string()) }
     };
 
     // Drop this peer from the live registry however the session ends, so the
@@ -281,25 +335,42 @@ fn rect_gap(a: deskoryn_core::geometry::Rect, b: deskoryn_core::geometry::Rect) 
     dx + dy
 }
 
-fn capabilities_from(config: &AppConfig) -> deskoryn_proto::Capabilities {
+fn capabilities_from(config: &AppConfig, features: &FeatureState) -> deskoryn_proto::Capabilities {
+    // The Settings master toggles override the per-type config flags: a disabled
+    // master advertises no clipboard/audio capability at all.
+    let clip = features.clipboard.load(Ordering::Relaxed);
     deskoryn_proto::Capabilities {
-        clipboard_text: config.clipboard.sync_text,
-        clipboard_images: config.clipboard.sync_images,
-        clipboard_files: config.clipboard.sync_files,
+        clipboard_text: clip && config.clipboard.sync_text,
+        clipboard_images: clip && config.clipboard.sync_images,
+        clipboard_files: clip && config.clipboard.sync_files,
         file_transfer: true,
-        audio_forward: config.audio.forward_enabled,
+        audio_forward: features.audio.load(Ordering::Relaxed),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{rect_gap, start_position};
+    use super::{capabilities_from, rect_gap, start_position, FeatureState};
+    use deskoryn_core::config::{AppConfig, DeviceConfig};
     use deskoryn_core::geometry::{Point, Rect, Size};
     use deskoryn_core::layout::{Monitor, VirtualDesktop};
     use deskoryn_core::{DeviceId, MonitorId};
 
     fn dev(b: u8) -> DeviceId {
         DeviceId::from_bytes([b; 16])
+    }
+
+    fn cfg() -> AppConfig {
+        AppConfig {
+            device: DeviceConfig { id: dev(1), name: "test".into() },
+            network: Default::default(),
+            input: Default::default(),
+            clipboard: Default::default(),
+            audio: Default::default(),
+            file_transfer: Default::default(),
+            layout: Default::default(),
+            peer_layouts: vec![],
+        }
     }
 
     fn mon(device: DeviceId, idx: u16, x: i32, y: i32, w: i32, h: i32) -> Monitor {
@@ -334,6 +405,49 @@ mod tests {
         assert_eq!(start_position(&vd, lin), Point::new(4800, 540));
         // Windows's gateway is Win-L (touches Lin-R), centered at 5760 + 1280 = 7040.
         assert_eq!(start_position(&vd, win), Point::new(7040, 720));
+    }
+
+    #[test]
+    fn feature_state_seeds_from_config() {
+        let mut c = cfg();
+        c.clipboard.sync_text = false;
+        c.clipboard.sync_images = false;
+        c.clipboard.sync_files = true; // any one → clipboard master on
+        c.audio.forward_enabled = true;
+        c.input.sharing_enabled = false;
+        let f = FeatureState::from_config(&c);
+        use std::sync::atomic::Ordering::Relaxed;
+        assert!(f.clipboard.load(Relaxed));
+        assert!(f.audio.load(Relaxed));
+        assert!(!f.input_sharing.load(Relaxed));
+    }
+
+    #[test]
+    fn clipboard_master_off_drops_all_clipboard_caps() {
+        // Per-type config flags all on, but the master toggle is off.
+        let c = cfg();
+        assert!(c.clipboard.sync_text && c.clipboard.sync_images && c.clipboard.sync_files);
+        let f = FeatureState::from_config(&c);
+        f.clipboard.store(false, std::sync::atomic::Ordering::Relaxed);
+        let caps = capabilities_from(&c, &f);
+        assert!(!caps.clipboard_text && !caps.clipboard_images && !caps.clipboard_files);
+        // File transfer is independent of the clipboard master.
+        assert!(caps.file_transfer);
+    }
+
+    #[test]
+    fn caps_follow_per_type_flags_when_master_on() {
+        let mut c = cfg();
+        c.clipboard.sync_text = true;
+        c.clipboard.sync_images = false;
+        c.clipboard.sync_files = true;
+        c.audio.forward_enabled = false;
+        let f = FeatureState::from_config(&c);
+        // Flip audio on live (master overrides the config snapshot).
+        f.audio.store(true, std::sync::atomic::Ordering::Relaxed);
+        let caps = capabilities_from(&c, &f);
+        assert!(caps.clipboard_text && !caps.clipboard_images && caps.clipboard_files);
+        assert!(caps.audio_forward);
     }
 
     #[test]
